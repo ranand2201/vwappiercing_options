@@ -1,3 +1,15 @@
+# vwappiercing_options project-specific
+# Service-account / broker credential keys must never be committed. This package is always
+# passed one via --key at runtime (e.g. bankniftyorb-*.json, which lives outside this repo) --
+# nothing here legitimately needs a tracked .json file.
+*.json
+
+# Broker log output (zebumynt_utitlity writes to <cwd>/Logs/)
+Logs/
+
+# JetBrains project files (not part of this repo's source)
+.idea/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
