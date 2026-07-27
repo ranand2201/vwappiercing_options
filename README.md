@@ -16,11 +16,19 @@ Two ways to run it:
   trade to the `BackTestData` tab. Same pattern-detection engine (`Logic/backtest_engine.py`) also powers
   `tests/test_pattern_dry_run.py`'s verbose trace, so the two can't drift apart.
 
+**BUY and SELL setups run as two fully independent state machines** — a piercing in one direction never
+blocks or gets clobbered by the other direction already having a setup or open trade in progress. Both can
+be mid-pattern, or both in a trade, at the same time.
+
 Piercing detection only runs between `execution start + 15 min` (lets VWAP settle) and `14:30:00`; an
-already-open trade or in-progress setup still runs to its natural conclusion after that cutoff. **SL is the
-one real exit** — Exit-1..4 (Length-of-Piercing, 0.5%, 0.75%, Bollinger) are parallel hypotheses tracked
-purely for comparison, not real closes; breaching one is logged but doesn't close the trade. Once SL hits,
-that trade is logged and the engine immediately resumes scanning for the next Piercing setup — there is no
+already-open trade or in-progress setup still runs to its natural conclusion after that cutoff. A piercing
+candle only counts once its Open starts at least 5 points clear of VWAP and its Close crosses to more than 6
+points past VWAP on the other side; a reclaimed setup only enters once LTP (live) / Close (backtest) clears
+back through VWAP by more than 5 points, in the piercing direction. Once pierced, reclaim is sought across as
+many subsequent candles as it takes (no abandon-after-one-miss). **SL is the one real exit** — Exit-1..4
+(Length-of-Piercing, 0.5%, 0.75%, Bollinger) are parallel hypotheses tracked purely for comparison, not real
+closes; breaching one is logged but doesn't close the trade. Once SL hits, that trade is logged and the
+engine immediately resumes scanning for the next Piercing setup in that direction — there is no
 one-trade-per-day cap. Any trade still open at **14:50** is force-closed at the prevailing price regardless
 of SL/Exit-1..4 state (logged to `Exit5 (EOD)`).
 

@@ -12,6 +12,11 @@ test_pattern_dry_run.py (prints a verbose trace) call this rather than
 keeping their own copies, so they can't drift from what the live engine
 actually does.
 
+BUY and SELL setups are tracked as two fully independent state machines (see
+_TradeState), mirroring the live engine, so a piercing in one direction is
+never blocked or lost while the other direction already has a setup/trade in
+progress.
+
 Entry fires once Reclaim is confirmed and price crosses back through VWAP in
 the piercing direction (BUY: back above VWAP; SELL: back below VWAP) --
 approximated from candle Close vs VWAP since there are no intrabar LTP ticks
@@ -47,6 +52,25 @@ STATUS_OK = "ok"
 DAY_START_TIME = "09:15:00"
 BOLLINGER_PERIOD = 20
 BOLLINGER_STD_DEV = 2
+
+
+class _TradeState:
+    """All the mutable pattern/trade-tracking state for one direction (BUY or SELL)."""
+
+    def __init__(self, direction):
+        self.direction = direction
+        self.state = STATE_SEEK_PIERCING
+        self.piercing_row = None
+        self.reclaim_row = None
+        self.current_trade = None
+        self.sl_level = 0.0
+        self.exit1_level = 0.0
+        self.exit2_level = 0.0
+        self.exit3_level = 0.0
+        self.mae = 0.0
+        self.mfe = 0.0
+        self.mae_time = ""
+        self.mfe_time = ""
 
 
 def resolve_front_month_future_symbol(broker, index_name, trade_date_str):
@@ -98,181 +122,171 @@ def run_backtest_for_day(broker, index_name, trade_date_str, candle_interval_min
 
     piercing_start_time = pattern_rules.compute_piercing_start_time(DAY_START_TIME)
 
-    state = STATE_SEEK_PIERCING
-    piercing_row = None
-    reclaim_row = None
-    direction = ""
-
-    current_trade = None
-    sl_level = exit1_level = exit2_level = exit3_level = 0.0
-    mae = mfe = 0.0
-    mae_time = mfe_time = ""
-
+    states = {"BUY": _TradeState("BUY"), "SELL": _TradeState("SELL")}
     results = []
-
-    def test_piercing(row, ts):
-        nonlocal piercing_row, direction, state
-        if not pattern_rules.is_piercing_window_open(pattern_rules.time_of_day(ts), piercing_start_time):
-            return False
-        direction_found = pattern_rules.piercing_direction(row)
-        if direction_found is None:
-            return False
-        piercing_row = row
-        direction = direction_found
-        state = STATE_SEEK_RECLAIM
-        log(f"[{ts}] PIERCING ({direction}) {_fmt_candle(row)}")
-        return True
 
     for i in range(len(candle_data)):
         row = candle_data.iloc[i]
         ts = str(row[DATE_TIME])
 
-        if state == STATE_SEEK_PIERCING:
-            if not test_piercing(row, ts):
-                log(f"[{ts}] seeking piercing {_fmt_candle(row)}")
+        for direction, ds in states.items():
+            if ds.state == STATE_SEEK_PIERCING:
+                if not pattern_rules.is_piercing_window_open(pattern_rules.time_of_day(ts), piercing_start_time):
+                    continue
+                if pattern_rules.piercing_direction(row) == direction:
+                    ds.piercing_row = row
+                    ds.state = STATE_SEEK_RECLAIM
+                    log(f"[{ts}] ({direction}) PIERCING {_fmt_candle(row)}")
+                else:
+                    log(f"[{ts}] ({direction}) seeking piercing {_fmt_candle(row)}")
 
-        elif state == STATE_SEEK_RECLAIM:
-            if pattern_rules.is_reclaimed(row, direction):
-                reclaim_row = row
-                state = STATE_SEEK_CONFIRM_ENTRY
-                log(f"[{ts}] RECLAIM {_fmt_candle(row)}")
-            else:
-                # Not reclaimed yet -- keep waiting on subsequent candles rather than abandoning
-                # after just one miss. The piercing candle stays the reference point.
-                log(f"[{ts}] no reclaim yet, still waiting {_fmt_candle(row)}")
+            elif ds.state == STATE_SEEK_RECLAIM:
+                if pattern_rules.is_reclaimed(row, direction):
+                    ds.reclaim_row = row
+                    ds.state = STATE_SEEK_CONFIRM_ENTRY
+                    log(f"[{ts}] ({direction}) RECLAIM {_fmt_candle(row)}")
+                else:
+                    # Not reclaimed yet -- keep waiting on subsequent candles rather than
+                    # abandoning after just one miss. The piercing candle stays the reference point.
+                    log(f"[{ts}] ({direction}) no reclaim yet, still waiting {_fmt_candle(row)}")
 
-        elif state == STATE_SEEK_CONFIRM_ENTRY:
-            # entry fires when this candle's Close crosses back through VWAP in the piercing
-            # direction (BUY: back above VWAP; SELL: back below VWAP) -- no invalidation here,
-            # the setup just keeps waiting, candle after candle, until this happens or EOD.
-            triggered = pattern_rules.is_vwap_reentry_triggered(row[CLOSE_PRICE], row[VWAP], direction)
-            log(f"[{ts}] waiting for entry ({direction}): close={row[CLOSE_PRICE]} vs VWAP={row[VWAP]:.2f} "
-               f"{_fmt_candle(row)} {'-> TRIGGERED' if triggered else ''}")
-            if not triggered:
-                continue
+            elif ds.state == STATE_SEEK_CONFIRM_ENTRY:
+                # entry fires when this candle's Close crosses back through VWAP in the piercing
+                # direction (BUY: back above VWAP; SELL: back below VWAP) -- no invalidation here,
+                # the setup just keeps waiting, candle after candle, until this happens or EOD.
+                triggered = pattern_rules.is_vwap_reentry_triggered(row[CLOSE_PRICE], row[VWAP], direction)
+                log(f"[{ts}] ({direction}) waiting for entry: close={row[CLOSE_PRICE]} vs VWAP={row[VWAP]:.2f} "
+                   f"{_fmt_candle(row)} {'-> TRIGGERED' if triggered else ''}")
+                if not triggered:
+                    continue
 
-            entry_price = float(row[CLOSE_PRICE])
-            current_trade = paper_trade_row()
-            current_trade.date = trade_date_str
-            current_trade.future = future_symbol
-            current_trade.option_name = ""
-            current_trade.trade_type = direction
-            current_trade.piercing_candle = _to_snapshot(piercing_row)
-            current_trade.reclaim_candle = _to_snapshot(reclaim_row)
-            current_trade.confirm_candle = _to_snapshot(row)
-            current_trade.entry_future_price = entry_price
-            current_trade.entry_option_price = 0.0
-            current_trade.entry_timestamp = ts
+                entry_price = float(row[CLOSE_PRICE])
+                trade = paper_trade_row()
+                trade.date = trade_date_str
+                trade.future = future_symbol
+                trade.option_name = ""
+                trade.trade_type = direction
+                trade.piercing_candle = _to_snapshot(ds.piercing_row)
+                trade.reclaim_candle = _to_snapshot(ds.reclaim_row)
+                trade.confirm_candle = _to_snapshot(row)
+                trade.entry_future_price = entry_price
+                trade.entry_option_price = 0.0
+                trade.entry_timestamp = ts
 
-            piercing_high = float(piercing_row[HIGH_PRICE])
-            piercing_low = float(piercing_row[LOW_PRICE])
-            piercing_length = piercing_high - piercing_low
+                piercing_high = float(ds.piercing_row[HIGH_PRICE])
+                piercing_low = float(ds.piercing_row[LOW_PRICE])
+                piercing_length = piercing_high - piercing_low
 
-            if direction == "BUY":
-                sl_level = piercing_low
-                exit1_level = entry_price + piercing_length
-                exit2_level = get_target_price_by_percentage(entry_price, 0.5, "buy")
-                exit3_level = get_target_price_by_percentage(entry_price, 0.75, "buy")
-            else:
-                sl_level = piercing_high
-                exit1_level = entry_price - piercing_length
-                exit2_level = get_target_price_by_percentage(entry_price, 0.5, "sell")
-                exit3_level = get_target_price_by_percentage(entry_price, 0.75, "sell")
+                if direction == "BUY":
+                    ds.sl_level = piercing_low
+                    ds.exit1_level = entry_price + piercing_length
+                    ds.exit2_level = get_target_price_by_percentage(entry_price, 0.5, "buy")
+                    ds.exit3_level = get_target_price_by_percentage(entry_price, 0.75, "buy")
+                else:
+                    ds.sl_level = piercing_high
+                    ds.exit1_level = entry_price - piercing_length
+                    ds.exit2_level = get_target_price_by_percentage(entry_price, 0.5, "sell")
+                    ds.exit3_level = get_target_price_by_percentage(entry_price, 0.75, "sell")
 
-            mae, mfe = 0.0, 0.0
-            mae_time = mfe_time = ts
-            state = STATE_IN_TRADE
+                ds.mae, ds.mfe = 0.0, 0.0
+                ds.mae_time = ds.mfe_time = ts
+                ds.current_trade = trade
+                ds.state = STATE_IN_TRADE
 
-            # Exit-4 (Bollinger) isn't fixed at entry like SL/Exit-1..3 -- it moves every candle
-            # (checked live in the STATE_IN_TRADE loop below). Shown here is just its value at
-            # the moment of entry, for visibility.
-            entry_bollinger_level = upper_band.iloc[i] if direction == "BUY" else lower_band.iloc[i]
-            exit4_str = f"{entry_bollinger_level:.2f}" if entry_bollinger_level == entry_bollinger_level else "n/a"
+                # Exit-4 (Bollinger) isn't fixed at entry like SL/Exit-1..3 -- it moves every
+                # candle (checked live in the STATE_IN_TRADE branch below). Shown here is just
+                # its value at the moment of entry, for visibility.
+                entry_bollinger_level = upper_band.iloc[i] if direction == "BUY" else lower_band.iloc[i]
+                exit4_str = f"{entry_bollinger_level:.2f}" if entry_bollinger_level == entry_bollinger_level else "n/a"
 
-            log(f"[{ts}] CONFIRM/ENTRY {direction} @ {entry_price} "
-               f"(piercing: {piercing_row[DATE_TIME]}, reclaim: {reclaim_row[DATE_TIME]}) "
-               f"SL={sl_level} Exit1={exit1_level:.2f} Exit2={exit2_level:.2f} Exit3={exit3_level:.2f} "
-               f"Exit4(@entry)={exit4_str}")
+                log(f"[{ts}] ({direction}) CONFIRM/ENTRY @ {entry_price} "
+                   f"(piercing: {ds.piercing_row[DATE_TIME]}, reclaim: {ds.reclaim_row[DATE_TIME]}) "
+                   f"SL={ds.sl_level} Exit1={ds.exit1_level:.2f} Exit2={ds.exit2_level:.2f} Exit3={ds.exit3_level:.2f} "
+                   f"Exit4(@entry)={exit4_str}")
 
-        elif state == STATE_IN_TRADE:
-            high = float(row[HIGH_PRICE])
-            low = float(row[LOW_PRICE])
-            worst = (low - current_trade.entry_future_price) if direction == "BUY" else (current_trade.entry_future_price - high)
-            best = (high - current_trade.entry_future_price) if direction == "BUY" else (current_trade.entry_future_price - low)
-            if worst < mae:
-                mae, mae_time = worst, ts
-            if best > mfe:
-                mfe, mfe_time = best, ts
+            elif ds.state == STATE_IN_TRADE:
+                trade = ds.current_trade
+                high = float(row[HIGH_PRICE])
+                low = float(row[LOW_PRICE])
+                worst = (low - trade.entry_future_price) if direction == "BUY" else (trade.entry_future_price - high)
+                best = (high - trade.entry_future_price) if direction == "BUY" else (trade.entry_future_price - low)
+                if worst < ds.mae:
+                    ds.mae, ds.mae_time = worst, ts
+                if best > ds.mfe:
+                    ds.mfe, ds.mfe_time = best, ts
 
-            # any trade still open at 14:50 is force-closed at this candle's Close, regardless of
-            # SL/Exit-1..4 state.
-            if pattern_rules.is_force_exit_time_reached(pattern_rules.time_of_day(ts)):
-                close_price = float(row[CLOSE_PRICE])
-                current_trade.exit5_eod.future_price = close_price
-                current_trade.exit5_eod.option_price = 0.0
-                current_trade.mae, current_trade.mae_time = mae, mae_time
-                current_trade.mfe, current_trade.mfe_time = mfe, mfe_time
-                results.append(current_trade)
-                log(f"[{ts}] force-exit (14:50 cutoff) @ {close_price} -- trade closed, resuming scan")
-                current_trade = None
-                piercing_row = None
-                reclaim_row = None
-                state = STATE_SEEK_PIERCING
-                continue
+                # any trade still open at 14:50 is force-closed at this candle's Close, regardless
+                # of SL/Exit-1..4 state.
+                if pattern_rules.is_force_exit_time_reached(pattern_rules.time_of_day(ts)):
+                    close_price = float(row[CLOSE_PRICE])
+                    trade.exit5_eod.future_price = close_price
+                    trade.exit5_eod.option_price = 0.0
+                    trade.mae, trade.mae_time = ds.mae, ds.mae_time
+                    trade.mfe, trade.mfe_time = ds.mfe, ds.mfe_time
+                    results.append(trade)
+                    log(f"[{ts}] ({direction}) force-exit (14:50 cutoff) @ {close_price} -- trade closed, resuming scan")
+                    ds.current_trade = None
+                    ds.piercing_row = None
+                    ds.reclaim_row = None
+                    ds.state = STATE_SEEK_PIERCING
+                    continue
 
-            # capture before-state so we can log the exact candle each hypothesis first hits --
-            # none of Exit-1..4 stop the trade (only SL does), so without this the trace gives no
-            # visibility into when/whether they fired.
-            was_hit = {
-                "Exit1 (Length of Piercing)": current_trade.exit1_hit.is_hit,
-                "Exit2 (0.5%)": current_trade.exit2_hit.is_hit,
-                "Exit3 (0.75%)": current_trade.exit3_hit.is_hit,
-                "Exit4 (Bollinger)": current_trade.exit4_hit.is_hit,
-            }
+                # capture before-state so we can log the exact candle each hypothesis first hits
+                # -- none of Exit-1..4 stop the trade (only SL does), so without this the trace
+                # gives no visibility into when/whether they fired.
+                was_hit = {
+                    "Exit1 (Length of Piercing)": trade.exit1_hit.is_hit,
+                    "Exit2 (0.5%)": trade.exit2_hit.is_hit,
+                    "Exit3 (0.75%)": trade.exit3_hit.is_hit,
+                    "Exit4 (Bollinger)": trade.exit4_hit.is_hit,
+                }
 
-            _mark_level_if_hit(current_trade.sl_hit, sl_level, row, direction, ts, is_stop=True)
-            _mark_level_if_hit(current_trade.exit1_hit, exit1_level, row, direction, ts)
-            _mark_level_if_hit(current_trade.exit2_hit, exit2_level, row, direction, ts)
-            _mark_level_if_hit(current_trade.exit3_hit, exit3_level, row, direction, ts)
+                _mark_level_if_hit(trade.sl_hit, ds.sl_level, row, direction, ts, is_stop=True)
+                _mark_level_if_hit(trade.exit1_hit, ds.exit1_level, row, direction, ts)
+                _mark_level_if_hit(trade.exit2_hit, ds.exit2_level, row, direction, ts)
+                _mark_level_if_hit(trade.exit3_hit, ds.exit3_level, row, direction, ts)
 
-            # Exit-4 target: Bollinger upper band for BUY, lower band for SELL -- price reaching
-            # the band in the trade's favor, same target-style semantics as Exit-1..3 -- but it's
-            # a hypothesis only, same as Exit-1..3: breaching it is logged, not a real exit.
-            bollinger_level = upper_band.iloc[i] if direction == "BUY" else lower_band.iloc[i]
-            bollinger_str = f"{bollinger_level:.2f}" if bollinger_level == bollinger_level else "n/a"  # NaN check
-            if bollinger_level == bollinger_level:  # (first BOLLINGER_PERIOD candles have no band yet)
-                _mark_level_if_hit(current_trade.exit4_hit, float(bollinger_level), row, direction, ts)
+                # Exit-4 target: Bollinger upper band for BUY, lower band for SELL -- price
+                # reaching the band in the trade's favor, same target-style semantics as
+                # Exit-1..3 -- but it's a hypothesis only, same as Exit-1..3: breaching it is
+                # logged, not a real exit.
+                bollinger_level = upper_band.iloc[i] if direction == "BUY" else lower_band.iloc[i]
+                bollinger_str = f"{bollinger_level:.2f}" if bollinger_level == bollinger_level else "n/a"  # NaN check
+                if bollinger_level == bollinger_level:  # (first BOLLINGER_PERIOD candles have no band yet)
+                    _mark_level_if_hit(trade.exit4_hit, float(bollinger_level), row, direction, ts)
 
-            for label, hit_obj in (("Exit1 (Length of Piercing)", current_trade.exit1_hit),
-                                   ("Exit2 (0.5%)", current_trade.exit2_hit),
-                                   ("Exit3 (0.75%)", current_trade.exit3_hit),
-                                   ("Exit4 (Bollinger)", current_trade.exit4_hit)):
-                if not was_hit[label] and hit_obj.is_hit:
-                    log(f"[{ts}] {label} target BREACHED @ {hit_obj.future_price} "
-                       f"(hypothesis only -- trade continues, only SL closes it)")
+                for label, hit_obj in (("Exit1 (Length of Piercing)", trade.exit1_hit),
+                                       ("Exit2 (0.5%)", trade.exit2_hit),
+                                       ("Exit3 (0.75%)", trade.exit3_hit),
+                                       ("Exit4 (Bollinger)", trade.exit4_hit)):
+                    if not was_hit[label] and hit_obj.is_hit:
+                        log(f"[{ts}] ({direction}) {label} target BREACHED @ {hit_obj.future_price} "
+                           f"(hypothesis only -- trade continues, only SL closes it)")
 
-            log(f"[{ts}] in-trade {_fmt_candle(row)} SL={sl_level} Exit4(Bollinger)={bollinger_str}")
+                log(f"[{ts}] ({direction}) in-trade {_fmt_candle(row)} SL={ds.sl_level} Exit4(Bollinger)={bollinger_str}")
 
-            if current_trade.sl_hit.is_hit:
-                current_trade.mae, current_trade.mae_time = mae, mae_time
-                current_trade.mfe, current_trade.mfe_time = mfe, mfe_time
-                results.append(current_trade)
-                log(f"[{ts}] SL hit @ {sl_level} -- trade closed, resuming scan")
-                current_trade = None
-                piercing_row = None
-                reclaim_row = None
-                state = STATE_SEEK_PIERCING
+                if trade.sl_hit.is_hit:
+                    trade.mae, trade.mae_time = ds.mae, ds.mae_time
+                    trade.mfe, trade.mfe_time = ds.mfe, ds.mfe_time
+                    results.append(trade)
+                    log(f"[{ts}] ({direction}) SL hit @ {ds.sl_level} -- trade closed, resuming scan")
+                    ds.current_trade = None
+                    ds.piercing_row = None
+                    ds.reclaim_row = None
+                    ds.state = STATE_SEEK_PIERCING
 
-    # end of day: a trade still open (SL never hit) gets its exit5_eod stamped with the day's
-    # last close, mirroring the live engine's EOD finalize.
-    if state == STATE_IN_TRADE and current_trade is not None:
-        last_close = float(candle_data.iloc[-1][CLOSE_PRICE])
-        current_trade.exit5_eod.future_price = last_close
-        current_trade.exit5_eod.option_price = 0.0
-        current_trade.mae, current_trade.mae_time = mae, mae_time
-        current_trade.mfe, current_trade.mfe_time = mfe, mfe_time
-        results.append(current_trade)
-        log(f"End of day: trade still open (SL not hit), closed at last price {last_close}")
+    # end of day: any direction still IN_TRADE (SL never hit) gets its exit5_eod stamped with the
+    # day's last close, mirroring the live engine's EOD finalize.
+    for direction, ds in states.items():
+        if ds.state == STATE_IN_TRADE and ds.current_trade is not None:
+            trade = ds.current_trade
+            last_close = float(candle_data.iloc[-1][CLOSE_PRICE])
+            trade.exit5_eod.future_price = last_close
+            trade.exit5_eod.option_price = 0.0
+            trade.mae, trade.mae_time = ds.mae, ds.mae_time
+            trade.mfe, trade.mfe_time = ds.mfe, ds.mfe_time
+            results.append(trade)
+            log(f"End of day ({direction}): trade still open (SL not hit), closed at last price {last_close}")
 
     return results, future_symbol, STATUS_OK
 
