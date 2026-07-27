@@ -137,10 +137,9 @@ def run_backtest_for_day(broker, index_name, trade_date_str, candle_interval_min
                 state = STATE_SEEK_CONFIRM_ENTRY
                 log(f"[{ts}] RECLAIM {_fmt_candle(row)}")
             else:
-                piercing_row = None
-                state = STATE_SEEK_PIERCING
-                if not test_piercing(row, ts):
-                    log(f"[{ts}] no reclaim, no new piercing -> back to seeking {_fmt_candle(row)}")
+                # Not reclaimed yet -- keep waiting on subsequent candles rather than abandoning
+                # after just one miss. The piercing candle stays the reference point.
+                log(f"[{ts}] no reclaim yet, still waiting {_fmt_candle(row)}")
 
         elif state == STATE_SEEK_CONFIRM_ENTRY:
             # entry fires when this candle's Close crosses back through VWAP in the piercing

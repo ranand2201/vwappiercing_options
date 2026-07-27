@@ -137,11 +137,20 @@ class LogicVwapPiercingOptions(ILogic):
     def execute(self):
         self.pre_requisite_complete_event.wait()
         print(self.logic_name, ": Execution Started", self.execution_start_time)
+        has_started = False
+        piercing_window_announced = False
 
         while not self.__is_time_reached(self.execution_stop_time):
             if not self.__is_time_reached(self.execution_start_time):
                 time.sleep(2)
                 continue
+
+            if not has_started:
+                print(self.logic_name, f": [{datetime.now().strftime('%H:%M:%S')}] execution start time reached, beginning candle/tick processing")
+                has_started = True
+            if not piercing_window_announced and self.__is_piercing_window_open():
+                print(self.logic_name, f": [{datetime.now().strftime('%H:%M:%S')}] piercing window open (>= {self.piercing_start_time})")
+                piercing_window_announced = True
 
             self.__process_new_candles()
 
@@ -198,25 +207,31 @@ class LogicVwapPiercingOptions(ILogic):
         self.processed_candle_count = len(candle_data)
 
     def __on_candle_close(self, row):
+        ts = str(row[DATE_TIME])
         if self.state == self.STATE_SEEK_PIERCING:
-            self.__test_piercing(row)
+            if not self.__test_piercing(row):
+                print(self.logic_name, f": [{ts}] seeking piercing {self.__fmt_candle(row)}")
         elif self.state == self.STATE_SEEK_RECLAIM:
             if pattern_rules.is_reclaimed(row, self.direction):
                 self.reclaim_candle = row
                 self.state = self.STATE_SEEK_CONFIRM_ENTRY
+                print(self.logic_name, f": [{ts}] RECLAIM {self.__fmt_candle(row)}")
             else:
-                self.state = self.STATE_SEEK_PIERCING
-                self.piercing_candle = None
-                self.__test_piercing(row)
+                # Not reclaimed yet -- keep waiting on subsequent candles rather than abandoning
+                # after just one miss. The piercing candle stays the reference point.
+                print(self.logic_name, f": [{ts}] no reclaim yet, still waiting {self.__fmt_candle(row)}")
         # STATE_SEEK_CONFIRM_ENTRY needs no candle-close handling: entry is now a live LTP-vs-VWAP
         # check (see __check_entry_trigger), not a candle-level event.
 
     def __test_piercing(self, row):
         if not self.__is_piercing_window_open():
-            return
+            return False
         direction = pattern_rules.piercing_direction(row)
-        if direction is not None:
-            self.__set_piercing(row, direction)
+        if direction is None:
+            return False
+        self.__set_piercing(row, direction)
+        print(self.logic_name, f": [{str(row[DATE_TIME])}] PIERCING ({direction}) {self.__fmt_candle(row)}")
+        return True
 
     def __is_piercing_window_open(self):
         return pattern_rules.is_piercing_window_open(datetime.now().strftime("%H:%M:%S"),
@@ -238,7 +253,11 @@ class LogicVwapPiercingOptions(ILogic):
         current_vwap = self.__get_latest_vwap()
         if current_vwap is None:
             return
-        if not pattern_rules.is_vwap_reentry_triggered(ltp, current_vwap, self.direction):
+        triggered = pattern_rules.is_vwap_reentry_triggered(ltp, current_vwap, self.direction)
+        now_str = datetime.now().strftime("%H:%M:%S")
+        print(self.logic_name, f": [{now_str}] waiting for entry ({self.direction}): LTP={ltp} vs VWAP={current_vwap:.2f}",
+             "-> TRIGGERED" if triggered else "")
+        if not triggered:
             return
         self.__enter_trade(ltp)
 
@@ -359,6 +378,7 @@ class LogicVwapPiercingOptions(ILogic):
         self.__mark_exit_if_hit(self.current_trade.exit3_hit, self.exit3_level, future_ltp, option_ltp, now_str)
 
         bollinger_level = self.__get_bollinger_exit_level()
+        bollinger_str = f"{bollinger_level:.2f}" if bollinger_level is not None else "n/a"
         if bollinger_level is not None:
             self.__mark_exit_if_hit(self.current_trade.exit4_hit, bollinger_level, future_ltp, option_ltp, now_str)
 
@@ -369,6 +389,10 @@ class LogicVwapPiercingOptions(ILogic):
             if not was_hit[label] and hit_obj.is_hit:
                 print(self.logic_name, f": {label} target BREACHED @ {hit_obj.future_price}",
                      "(hypothesis only -- trade continues, only SL closes it)")
+
+        print(self.logic_name, f": [{now_str}] in-trade LTP={future_ltp} SL={self.sl_level} "
+             f"Exit1={self.exit1_level:.2f} Exit2={self.exit2_level:.2f} Exit3={self.exit3_level:.2f} "
+             f"Exit4(Bollinger)={bollinger_str}")
 
         # SL is the one real exit here. Once it fires, the position is closed for real, so log
         # the trade now and go back to scanning for the next Piercing setup -- not capped at
@@ -439,6 +463,10 @@ class LogicVwapPiercingOptions(ILogic):
         return candle_snapshot(timestamp=str(row[DATE_TIME]), open=float(row[OPEN_PRICE]),
                                high=float(row[HIGH_PRICE]), low=float(row[LOW_PRICE]),
                                close=float(row[CLOSE_PRICE]), vwap=float(row[VWAP]))
+
+    def __fmt_candle(self, row):
+        return (f"O={row[OPEN_PRICE]} H={row[HIGH_PRICE]} L={row[LOW_PRICE]} C={row[CLOSE_PRICE]} "
+               f"VWAP={row[VWAP]:.2f}")
 
     def __is_time_reached(self, str_time):
         target_time = datetime.strptime(str_time, "%H:%M:%S").time()
