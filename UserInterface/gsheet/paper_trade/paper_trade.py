@@ -15,9 +15,12 @@ class UserInterfacePaperTrade:
                                                   spread_sheet_name="VWAPPiercingOptions")
         self.gworksheet_paper_trade = self.googlesheet_utility.get_work_sheet("PaperTradeData")
 
-    def write_trade(self, p_paper_trade_row: paper_trade_row):
+    def write_trade(self, p_paper_trade_row: paper_trade_row, p_interval, p_best_case_exit):
+        # Interval + Best Case Exit mirror the same two extra columns BackTestData has -- appended
+        # at the end, same as UserInterfaceBackTest.write_trade.
         try:
-            self.gworksheet_paper_trade.append_table(values=p_paper_trade_row.to_sheet_row(),
+            values = p_paper_trade_row.to_sheet_row() + [p_interval, p_best_case_exit]
+            self.gworksheet_paper_trade.append_table(values=values,
                                                       start='A1', dimension='ROWS', overwrite=False)
         except:
             print("Exception while writing paper trade row to PaperTradeData")

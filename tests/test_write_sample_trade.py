@@ -13,6 +13,7 @@ from datetime import date, datetime
 
 from BusinessLogic.vwappiercing_options.UserInterface.gsheet.paper_trade.paper_trade import UserInterfacePaperTrade
 from BusinessLogic.vwappiercing_options.DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_hit, eod_exit
+from BusinessLogic.vwappiercing_options.Logic.backtest_engine import describe_exit_outcomes
 
 
 def build_sample_row():
@@ -54,5 +55,6 @@ if __name__ == "__main__":
 
     print("Writing sample row via UserInterfacePaperTrade...")
     writer = UserInterfacePaperTrade(args.key)
-    writer.write_trade(build_sample_row())
+    sample_row = build_sample_row()
+    writer.write_trade(sample_row, 15, describe_exit_outcomes(sample_row))
     print("Done. Check the PaperTradeData tab in the VWAPPiercingOptions Google Sheet for the new row.")

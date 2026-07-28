@@ -89,17 +89,19 @@ service-account email found in your `--key` json file. It needs 4 tabs:
   Delta Days in columns C/D. Used by both the live engine and, by default, `run_backtest.py`.
 - **`PaperTradeData`** — written by the **live** engine. One row per completed trade (Date, Future, Option
   Name, Trade Type, Piercing/Reclaim/Confirm candle snapshots, Entry, SL/Exit-1..4/EOD hits, MAE/MFE,
-  including real option premiums).
+  including real option premiums), plus `Interval` and `Best Case Exit` (see below).
 - **`BackTestData`** — written by **`run_backtest.py`**. Same row layout as `PaperTradeData` (both use the
   `paper_trade_row` dataclass, `DataTypes/paper_trade_data.py`) — but since a historical replay has no real
   option data, `Option Name`/`Option Price` columns are just left blank/0.0. `Exit5 (EOD)` is populated
-  with the day's last close for any trade still open (SL never hit) at end of day. Two extra columns are
-  appended at the end, **BackTestData-only**: `Interval` (the candle interval that run used) and
-  `Best Case Exit` — profit/loss in points for every Exit-1..4 that was hit before the trade closed (e.g.
-  `Exit1:+23.90, Exit3:+65.20 (Best: Exit3)`), or `SL` if none of them were ever hit.
+  with the day's last close for any trade still open (SL never hit) at end of day.
 
-See `VWAPPiercingOptions.xlsx` for the original column layout reference (BackTestData has since been
-updated to mirror PaperTradeData's fuller layout rather than the simpler one shown there).
+Both `PaperTradeData` and `BackTestData` end with the same two extra columns: `Interval` (the candle
+interval that run used) and `Best Case Exit` — profit/loss in points for every Exit-1..4 that was hit before
+the trade closed (e.g. `Exit1:+23.90, Exit3:+65.20 (Best: Exit3)`), or `SL` if none of them were ever hit
+(`Logic/backtest_engine.py`'s `describe_exit_outcomes()`, shared by both writers so they can't drift).
+
+See `VWAPPiercingOptions.xlsx` for the original column layout reference (both sheets have since been
+extended beyond the simpler layout shown there).
 
 ## Running the strategy (via executor.py)
 
@@ -141,11 +143,15 @@ python -m BusinessLogic.vwappiercing_options.run_backtest --key ..\bankniftyorb-
 **Important, confirmed in testing**: NIFTY here trades **monthly** futures (confirmed via `search_scrip` —
 only ~1 contract/month is ever listed, e.g. `NIFTY28JUL26F` / `NIFTY25AUG26F` / `NIFTY29SEP26F`), not
 weekly, despite the similar-looking `F`-suffixed naming. The front-month contract for each historical day
-is resolved locally (no network call, via `Logic/backtest_engine.py:resolve_front_month_future_symbol`).
-The broker only retains historical OHLC for contracts that haven't expired yet — once a contract rolls off,
-its data is no longer retrievable, regardless of how recently it expired — so any date whose front-month
-contract has since expired prints `no candle data -- contract likely expired/delisted, skipping` rather
-than failing the whole run.
+is resolved locally (no network call, via `Logic/backtest_engine.py:resolve_front_month_future_symbol`) —
+during the **last 7 calendar days of a month**, this rolls forward to next month's contract instead of the
+current month's, since liquidity in the current month's contract thins out sharply in its final week as the
+market rolls over. The **live engine** (`executor.py`) resolves its future symbol the same way, against
+today's date, at startup — so live and backtest can never disagree on which contract is "front month" on a
+given day. The broker only retains historical OHLC for contracts that haven't expired yet — once a contract
+rolls off, its data is no longer retrievable, regardless of how recently it expired — so any date whose
+front-month contract has since expired prints `no candle data -- contract likely expired/delisted, skipping`
+rather than failing the whole run.
 
 Each run can write multiple rows per day (one per trade — SL closes a trade and the engine resumes scanning
 within the same day), or zero if no valid Piercing/Reclaim/Confirm/entry sequence formed. Re-running is

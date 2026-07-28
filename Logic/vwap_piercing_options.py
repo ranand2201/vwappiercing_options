@@ -20,7 +20,6 @@ from datetime import datetime, date, timedelta
 from BusinessLogic.interfaces.ILogic import *
 from BrokerUtility.pal.utility_manager import *
 from Utility.quotes_utility import *
-from Utility.nse_utility import *
 from Utility.utility import *
 from DataTypes.defines import *
 from DataTypes.trade_data import *
@@ -29,6 +28,7 @@ from ..UserInterface.adapter.login.login import *
 from ..UserInterface.adapter.config.config import *
 from ..UserInterface.gsheet.paper_trade.paper_trade import *
 from . import pattern_rules
+from .backtest_engine import resolve_front_month_future_symbol, describe_exit_outcomes
 from .option_selection import select_by_premium
 
 STATE_SEEK_PIERCING = "SEEK_PIERCING"
@@ -45,6 +45,10 @@ class _DirectionState:
         self.state = STATE_SEEK_PIERCING
         self.piercing_candle = None
         self.reclaim_candle = None
+        # ticks are polled every few seconds, but the periodic waiting-for-entry/in-trade status
+        # line should only print once per candle close, not every poll -- this tracks the candle
+        # timestamp that was last logged for that purpose.
+        self.last_logged_candle_ts = None
 
         self.current_trade: paper_trade_row = None
         self.option_symbol = ""
@@ -82,7 +86,6 @@ class LogicVwapPiercingOptions(ILogic):
         self.obj_ui_adapter_login: UserInterfaceAdapterLogin = UserInterfaceAdapterLogin(args)
         self.obj_ui_adapter_config: UserInterfaceAdapterConfig = UserInterfaceAdapterConfig(args)
         self.trade_utility = self.obj_utility_manager.get_utility_object(self.obj_ui_adapter_login.get_data())
-        self.nse_utility = nse_utitlity()
         self.quotes_utility: QuoteUtility = quotes_utility
         # wire this up now, before any threads start -- pre_requisite_thread calls
         # quotes_utility.add_stocks() almost immediately, which needs trade_utility to already be
@@ -137,11 +140,14 @@ class LogicVwapPiercingOptions(ILogic):
     def pre_requisite_thread_handler(self):
         print(self.logic_name, ": Inside pre-requisite thread")
         broker = self.trade_utility.get_broker_utility()
-        current_week_expiry, next_week_expiry, monthly_expiry, is_expiry_day, \
-            is_current_week_monthly_expiry, is_next_week_monthly_expiry = \
-            self.nse_utility.get_index_expiry_date(self.index_name)
-        self.current_week_expiry = current_week_expiry
-        self.future_symbol = broker.get_future_name(self.index_name, current_week_expiry)
+        # NIFTY here trades MONTHLY futures, not weekly (see backtest_engine.resolve_front_month_
+        # future_symbol) -- reuse that same resolution (incl. its last-week-of-month rollover to
+        # next month's contract) rather than nse_utility.get_index_expiry_date's weekly-oriented
+        # logic, so the live engine and backtest can never disagree on which contract is "front
+        # month" on a given day.
+        today_str = date.today().strftime("%Y-%m-%d")
+        self.future_symbol, self.current_expiry = resolve_front_month_future_symbol(
+            broker, self.index_name, today_str)
         print(self.logic_name, ": Future symbol resolved: ", self.future_symbol)
         # Zebu's fetchOHLC/get_quotes treat market_type="" as "parse this as an option symbol"
         # (see zebumynt_utitlity.fetchOHLC / __get_option_name); a future needs any non-empty,
@@ -243,7 +249,12 @@ class LogicVwapPiercingOptions(ILogic):
         # check (see __check_entry_trigger), not a candle-level event.
 
     def __test_piercing(self, ds: _DirectionState, row):
-        if not self.__is_piercing_window_open():
+        # gate on the candle's OWN timestamp, not wall-clock now() -- fetchOHLC backfills the
+        # whole day (09:15 onward) on every poll, so if the engine started late (or briefly lost
+        # connectivity) and is catching up on old candles, wall-clock time would already satisfy
+        # the window-open check for all of them, letting pre-window candles through incorrectly.
+        if not pattern_rules.is_piercing_window_open(pattern_rules.time_of_day(str(row[DATE_TIME])),
+                                                      self.piercing_start_time):
             return False
         direction = pattern_rules.piercing_direction(row)
         if direction != ds.direction:
@@ -273,8 +284,11 @@ class LogicVwapPiercingOptions(ILogic):
             return
         triggered = pattern_rules.is_vwap_reentry_triggered(ltp, current_vwap, ds.direction)
         now_str = datetime.now().strftime("%H:%M:%S")
-        print(self.logic_name, f": [{now_str}] ({ds.direction}) waiting for entry: LTP={ltp} vs VWAP={current_vwap:.2f}",
-             "-> TRIGGERED" if triggered else "")
+        if triggered:
+            # a real event -- always print, not subject to the once-per-candle throttle below.
+            print(self.logic_name, f": [{now_str}] ({ds.direction}) waiting for entry: LTP={ltp} vs VWAP={current_vwap:.2f} -> TRIGGERED")
+        else:
+            self.__log_once_per_candle(ds, f": [{now_str}] ({ds.direction}) waiting for entry: LTP={ltp} vs VWAP={current_vwap:.2f}")
         if not triggered:
             return
         self.__enter_trade(ds, ltp)
@@ -283,6 +297,21 @@ class LogicVwapPiercingOptions(ILogic):
         if self.last_candle_data is None or len(self.last_candle_data) == 0:
             return None
         return float(self.last_candle_data[VWAP].iloc[-1])
+
+    def __latest_candle_ts(self):
+        if self.last_candle_data is None or len(self.last_candle_data) == 0:
+            return None
+        return str(self.last_candle_data[DATE_TIME].iloc[-1])
+
+    def __log_once_per_candle(self, ds: _DirectionState, message):
+        # ticks come in every few seconds, but this status line should only print once per candle
+        # close -- suppress repeats until the underlying candle data actually advances.
+        candle_ts = self.__latest_candle_ts()
+        if candle_ts is not None and candle_ts == ds.last_logged_candle_ts:
+            return
+        if candle_ts is not None:
+            ds.last_logged_candle_ts = candle_ts
+        print(self.logic_name, message)
 
     def __enter_trade(self, ds: _DirectionState, entry_future_price):
         broker = self.trade_utility.get_broker_utility()
@@ -335,6 +364,9 @@ class LogicVwapPiercingOptions(ILogic):
         self.quotes_utility.add_stocks([option_symbol], [self.OPTION_MARKET_TYPE])
 
         ds.state = STATE_IN_TRADE
+        # reset the once-per-candle throttle on entry so the first in-trade status line isn't
+        # suppressed by the candle timestamp already logged during the waiting-for-entry phase.
+        ds.last_logged_candle_ts = None
         print(self.logic_name, ": Entered paper trade", ds.direction, option_symbol, "@", option_price)
 
     def __select_option_by_premium(self, broker, atm_strike, option_type):
@@ -342,7 +374,7 @@ class LogicVwapPiercingOptions(ILogic):
         # can miss the 100-110 target band entirely (observed in testing: +/-250 points wasn't
         # enough close to expiry). +/-1000 points (40 strikes @ 50-pt steps) covers that.
         lst_contracts = broker.get_option_chain(self.index_name, atm_strike, option_type,
-                                                 self.current_week_expiry, p_count=40)
+                                                 self.current_expiry, p_count=40)
         if not lst_contracts:
             return None, 0.0
 
@@ -408,7 +440,7 @@ class LogicVwapPiercingOptions(ILogic):
                 print(self.logic_name, f": ({ds.direction}) {label} target BREACHED @ {hit_obj.future_price}",
                      "(hypothesis only -- trade continues, only SL closes it)")
 
-        print(self.logic_name, f": [{now_str}] ({ds.direction}) in-trade LTP={future_ltp} SL={ds.sl_level} "
+        self.__log_once_per_candle(ds, f": [{now_str}] ({ds.direction}) in-trade LTP={future_ltp} SL={ds.sl_level} "
              f"Exit1={ds.exit1_level:.2f} Exit2={ds.exit2_level:.2f} Exit3={ds.exit3_level:.2f} "
              f"Exit4(Bollinger)={bollinger_str}")
 
@@ -463,13 +495,15 @@ class LogicVwapPiercingOptions(ILogic):
         self.__finalize_and_reset(ds, reason)
 
     def __finalize_and_reset(self, ds: _DirectionState, reason="EOD"):
-        self.obj_paper_trade_writer.write_trade(ds.current_trade)
+        self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
+                                                describe_exit_outcomes(ds.current_trade))
         print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}), logged to PaperTradeData:",
              ds.current_trade.trade_type, ds.current_trade.option_name)
         ds.current_trade = None
         ds.option_symbol = ""
         ds.piercing_candle = None
         ds.reclaim_candle = None
+        ds.last_logged_candle_ts = None
         # if the piercing window is already closed (past 14:30 or before start+15min at EOD),
         # this just idles in SEEK_PIERCING harmlessly -- __test_piercing gates on the window.
         ds.state = STATE_SEEK_PIERCING
