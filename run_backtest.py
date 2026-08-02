@@ -43,7 +43,7 @@ from BusinessLogic.vwappiercing_options.UserInterface.gsheet.config.config impor
 from BusinessLogic.vwappiercing_options.UserInterface.gsheet.backtest.backtest import UserInterfaceBackTest
 from BusinessLogic.vwappiercing_options.Logic.backtest_engine import run_backtest_for_day, describe_exit_outcomes, STATUS_NO_DATA
 from BrokerUtility.broker_platform.zebu.zebumynt_utility import zebumynt_utitlity
-
+from BrokerUtility.pal.utility_manager import *
 
 def get_trading_days_lookback(lookback_days):
     end_date = datetime.now().date() - timedelta(days=1)
@@ -74,10 +74,9 @@ if __name__ == "__main__":
         parser.error("use either --days or --start-date/--end-date, not both")
 
     login = UserInterfaceLogin(args.key).get_data()
-    broker = zebumynt_utitlity(user_name=login.user_id, client_id=login.api_key,
-                               secret_id=login.api_secret_key, pin=login.password,
-                               totp=login.totp_key, phone_no=login.phone_no)
-
+    obj_utility_manager: utility_manager = utility_manager()
+    broker = obj_utility_manager.get_utility_object(login).get_broker_utility()
+    
     candle_interval = args.interval
     if candle_interval is None:
         candle_interval = int(UserInterfaceConfig(args.key).get_data().candle_interval)
