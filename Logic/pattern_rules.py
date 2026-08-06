@@ -70,9 +70,9 @@ def piercing_direction(row):
     return None
 
 
-def is_reclaimed(row, direction):
+def is_reclaimed(row, vwap, direction):
     """True if this candle's close lands back on the opposite side of VWAP from the piercing close."""
-    return (row[CLOSE_PRICE] < row[VWAP]) if direction == "BUY" else (row[CLOSE_PRICE] > row[VWAP])
+    return (row[CLOSE_PRICE] < vwap) if direction == "BUY" else (row[CLOSE_PRICE] > vwap)
 
 
 def is_vwap_reentry_triggered(check_price, vwap, direction):

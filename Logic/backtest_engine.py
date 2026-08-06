@@ -63,6 +63,9 @@ class _TradeState:
         self.state = STATE_SEEK_PIERCING
         self.piercing_row = None
         self.reclaim_row = None
+        # 1-min reclaim rows carry no VWAP of their own -- the main-interval candle's VWAP they
+        # were checked against is tracked separately here.
+        self.reclaim_vwap = 0.0
         self.current_trade = None
         self.sl_level = 0.0
         self.exit1_level = 0.0
@@ -131,6 +134,15 @@ def run_backtest_for_day(broker, index_name, trade_date_str, candle_interval_min
     # day open -- always compute the real cumulative VWAP ourselves instead of trusting it.
     candle_data[VWAP] = [compute_vwap(candle_data, last_loc=i + 1) for i in range(len(candle_data))]
 
+    # Reclaim is checked against 1-min candles (finer granularity than candle_interval_minutes) so
+    # a reclaim isn't missed/delayed by waiting for the next full main-interval candle to close --
+    # but still measured against the main interval's own VWAP, not a separate 1-min VWAP. Falls
+    # back to the main-interval series (old per-main-candle behavior) if 1-min data isn't available.
+    candle_data_1min = broker.fetchOHLC(future_symbol, str_from_date, str_to_date,
+                                        interval="1minute", all_data=True, market_type="FUT")
+    if candle_data_1min is None or len(candle_data_1min) == 0:
+        candle_data_1min = candle_data
+
     # Bollinger bands are rolling (causal, only look back), so precomputing over the whole day
     # upfront and indexing by row is equivalent to recomputing fresh at each candle -- no
     # lookahead bias.
@@ -141,10 +153,18 @@ def run_backtest_for_day(broker, index_name, trade_date_str, candle_interval_min
 
     states = {"BUY": _TradeState("BUY"), "SELL": _TradeState("SELL")}
     results = []
+    one_min_idx = 0
 
     for i in range(len(candle_data)):
         row = candle_data.iloc[i]
         ts = str(row[DATE_TIME])
+
+        # 1-min candles closing within this main-interval candle's window, consumed in order --
+        # used for the reclaim check below at finer granularity than candle_interval_minutes.
+        sub_rows = []
+        while one_min_idx < len(candle_data_1min) and str(candle_data_1min.iloc[one_min_idx][DATE_TIME]) <= ts:
+            sub_rows.append(candle_data_1min.iloc[one_min_idx])
+            one_min_idx += 1
 
         for direction, ds in states.items():
             if ds.state == STATE_SEEK_PIERCING:
@@ -158,10 +178,13 @@ def run_backtest_for_day(broker, index_name, trade_date_str, candle_interval_min
                     log(f"[{ts}] ({direction}) seeking piercing {_fmt_candle(row)}")
 
             elif ds.state == STATE_SEEK_RECLAIM:
-                if pattern_rules.is_reclaimed(row, direction):
-                    ds.reclaim_row = row
+                # each 1-min sub-candle is checked against this main-interval candle's own VWAP.
+                reclaim_row = next((r for r in sub_rows if pattern_rules.is_reclaimed(r, row[VWAP], direction)), None)
+                if reclaim_row is not None:
+                    ds.reclaim_row = reclaim_row
+                    ds.reclaim_vwap = row[VWAP]
                     ds.state = STATE_SEEK_CONFIRM_ENTRY
-                    log(f"[{ts}] ({direction}) RECLAIM {_fmt_candle(row)}")
+                    log(f"[{reclaim_row[DATE_TIME]}] ({direction}) RECLAIM {_fmt_candle(reclaim_row, row[VWAP])}")
                 else:
                     # Not reclaimed yet -- keep waiting on subsequent candles rather than
                     # abandoning after just one miss. The piercing candle stays the reference point.
@@ -177,14 +200,18 @@ def run_backtest_for_day(broker, index_name, trade_date_str, candle_interval_min
                 if not triggered:
                     continue
 
-                entry_price = float(row[CLOSE_PRICE])
+                # entry price itself is read from the 1-min candle aligned with this main-interval
+                # candle's close (finer-grained than the main-interval Close), same source reclaim
+                # uses -- everything else about this trade (timestamp, confirm_candle, etc.)
+                # stays keyed to the main-interval candle.
+                entry_price = float(sub_rows[-1][CLOSE_PRICE]) if sub_rows else float(row[CLOSE_PRICE])
                 trade = paper_trade_row()
                 trade.date = trade_date_str
                 trade.future = future_symbol
                 trade.option_name = ""
                 trade.trade_type = direction
                 trade.piercing_candle = _to_snapshot(ds.piercing_row)
-                trade.reclaim_candle = _to_snapshot(ds.reclaim_row)
+                trade.reclaim_candle = _to_snapshot(ds.reclaim_row, ds.reclaim_vwap)
                 trade.confirm_candle = _to_snapshot(row)
                 trade.entry_future_price = entry_price
                 trade.entry_option_price = 0.0
@@ -369,13 +396,17 @@ def _mark_level_if_hit(exit_hit_obj: exit_hit, level, row, direction, ts, is_sto
         exit_hit_obj.is_hit = True
 
 
-def _fmt_candle(row):
+def _fmt_candle(row, vwap=None):
     # No intrabar ticks are available historically, so LTP is approximated as this candle's Close.
+    # vwap is an explicit override for 1-min reclaim rows, which carry no VWAP of their own --
+    # they're measured against the enclosing main-interval candle's VWAP instead.
+    v = row[VWAP] if vwap is None else vwap
     return (f"O={row[OPEN_PRICE]} H={row[HIGH_PRICE]} L={row[LOW_PRICE]} C={row[CLOSE_PRICE]} "
-           f"LTP={row[CLOSE_PRICE]} VWAP={row[VWAP]:.2f}")
+           f"LTP={row[CLOSE_PRICE]} VWAP={v:.2f}")
 
 
-def _to_snapshot(row):
+def _to_snapshot(row, vwap=None):
+    v = row[VWAP] if vwap is None else vwap
     return candle_snapshot(timestamp=str(row[DATE_TIME]), open=float(row[OPEN_PRICE]),
                            high=float(row[HIGH_PRICE]), low=float(row[LOW_PRICE]),
-                           close=float(row[CLOSE_PRICE]), vwap=float(row[VWAP]))
+                           close=float(row[CLOSE_PRICE]), vwap=float(v))

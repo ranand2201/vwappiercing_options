@@ -20,7 +20,7 @@ from BusinessLogic.vwappiercing_options.UserInterface.gsheet.login.login import 
 from BusinessLogic.vwappiercing_options.Logic.backtest_engine import run_backtest_for_day, describe_exit_outcomes, STATUS_NO_DATA
 from BrokerUtility.broker_platform.zebu.zebumynt_utility import zebumynt_utitlity
 from Utility.nse_utility import nse_utitlity
-
+from BrokerUtility.pal.utility_manager import *
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dry-run the VWAP piercing pattern against a past trading day")
@@ -31,9 +31,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     login = UserInterfaceLogin(args.key).get_data()
-    broker = zebumynt_utitlity(user_name=login.user_id, client_id=login.api_key,
-                               secret_id=login.api_secret_key, pin=login.password,
-                               totp=login.totp_key, phone_no=login.phone_no)
+    obj_utility_manager: utility_manager = utility_manager()
+    broker = obj_utility_manager.get_utility_object(login).get_broker_utility()
+    
 
     nse_utility = nse_utitlity()
     trade_date = args.date or nse_utility.get_prev_day_trade_date(preset=0)
