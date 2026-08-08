@@ -477,11 +477,25 @@ class VwapPiercingEngine(ILogic):
         trade_date = datetime.strptime(self.trade_date_str, "%Y-%m-%d")
         weekly_expiry = generate_weekly_expiry_dates(trade_date, 1)[0]
 
+        # probe the ATM strike alone first -- if this whole weekly expiry has since been
+        # delisted (confirmed in practice: Fyers returns "Invalid symbol provided" for expired
+        # weekly option contracts, not just "no data"), every one of the other ~40 candidates
+        # would fail identically. Bail out here instead of grinding through all of them.
+        probe_symbol = self.broker.get_option_name(self.index_name, weekly_expiry, False, str(atm_strike), option_type)
+        probe_price = self.__historical_option_close_near(probe_symbol, ts)
+        if probe_price is None:
+            self.__log(f"[{ts}] No historical option data available for expiry {weekly_expiry} "
+                      f"(likely delisted) -- skipping the rest of the strike scan for this trade")
+            return None, 0.0
+
         best_symbol, best_price = None, 0.0
         for offset in range(-20, 21):
             strike = atm_strike + offset * self.strike_step
-            symbol = self.broker.get_option_name(self.index_name, weekly_expiry, False, str(strike), option_type)
-            price = self.__historical_option_close_near(symbol, ts)
+            if offset == 0:
+                symbol, price = probe_symbol, probe_price  # already fetched above, don't refetch
+            else:
+                symbol = self.broker.get_option_name(self.index_name, weekly_expiry, False, str(strike), option_type)
+                price = self.__historical_option_close_near(symbol, ts)
             if price is None or price <= 0:
                 continue
             if self.target_premium_low <= price <= self.target_premium_high:
