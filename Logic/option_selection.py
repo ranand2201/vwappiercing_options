@@ -33,3 +33,27 @@ def select_by_premium(lst_contracts, dict_quotes, target_low=100.0, target_high=
             best_symbol = tsym
             best_price = ltp
     return best_symbol, best_price
+
+
+def select_cheapest_in_band(chain_df, option_type, band_low=100.0, band_high=130.0,
+                            symbol_col="symbol", type_col="option_type", ltp_col="ltp"):
+    """
+    chain_df: a DataFrame as returned by a broker's getOptionChain() (Fyers-style) -- one row per
+    contract, plus a non-option underlying/index row (option_type=="" there) that gets excluded
+    by the option_type filter below. Unlike select_by_premium's "closest to a target band" rule,
+    this only ever considers contracts strictly inside [band_low, band_high] and picks the
+    lowest-premium (cheapest) one among them. Returns (symbol, price), or (None, 0.0) if the
+    chain is empty/missing or nothing in the band qualifies.
+    """
+    if chain_df is None or len(chain_df) == 0:
+        return None, 0.0
+    if type_col not in chain_df.columns or ltp_col not in chain_df.columns or symbol_col not in chain_df.columns:
+        return None, 0.0
+
+    candidates = chain_df[(chain_df[type_col] == option_type) &
+                          (chain_df[ltp_col] >= band_low) & (chain_df[ltp_col] <= band_high)]
+    if candidates.empty:
+        return None, 0.0
+
+    best_row = candidates.loc[candidates[ltp_col].idxmin()]
+    return str(best_row[symbol_col]), float(best_row[ltp_col])
