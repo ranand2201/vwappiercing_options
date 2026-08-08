@@ -3,7 +3,7 @@
 Paper-trade signal logger for the **VWAP Piercing Options** strategy (see `VWAPPiercingOptions.xlsx` at the
 `trading` repo root for the original design spec). Detects a Piercing → Reclaim → Confirm candle pattern on
 the NIFTY future (against a running VWAP), and for each entry logs the forward price path to a Google Sheet,
-tracking SL plus 4 independent hypothetical exits (Length-of-Piercing, 0.5%, 0.75%, Bollinger Band) and
+tracking SL plus 4 independent hypothetical exits (Length-of-Piercing, 0.2%, 0.75%, Bollinger Band) and
 MAE/MFE.
 
 **No real orders are placed.** This is a signal + logging engine only, meant to compare exit rules before
@@ -32,7 +32,7 @@ candle only counts once its Open starts at least 5 points clear of VWAP and its 
 points past VWAP on the other side; a reclaimed setup only enters once LTP (live) / Close (backtest) clears
 back through VWAP by more than 5 points, in the piercing direction. Once pierced, reclaim is sought across as
 many subsequent candles as it takes (no abandon-after-one-miss). **SL is the one real exit** — Exit-1..4
-(Length-of-Piercing, 0.5%, 0.75%, Bollinger) are parallel hypotheses tracked purely for comparison, not real
+(Length-of-Piercing, 0.2%, 0.75%, Bollinger) are parallel hypotheses tracked purely for comparison, not real
 closes; breaching one is logged but doesn't close the trade. Once SL hits, that trade is logged and the
 engine immediately resumes scanning for the next Piercing setup in that direction — there is no
 one-trade-per-day cap. Any trade still open at **14:50** is force-closed at the prevailing price regardless

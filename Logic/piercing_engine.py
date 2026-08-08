@@ -21,7 +21,7 @@ BUY and SELL setups are tracked as two fully independent state machines (see
 _DirectionState) so a piercing in one direction is never blocked or lost
 while the other direction already has a setup/trade in progress.
 
-SL is the ONLY real exit -- Exit-1..4 (Length-of-Piercing, 0.5%, 0.75%,
+SL is the ONLY real exit -- Exit-1..4 (Length-of-Piercing, 0.2%, 0.75%,
 Bollinger) are all parallel hypotheses tracked for comparison only; breaching
 one is logged but doesn't close the trade. Any trade still open at 14:50 is
 force-closed at the prevailing price regardless of SL/Exit-1..4 state.
@@ -789,12 +789,12 @@ class VwapPiercingEngine(ILogic):
         if ds.direction == "BUY":
             ds.sl_level = piercing_low
             ds.exit1_level = entry_future_price + piercing_length
-            ds.exit2_level = get_target_price_by_percentage(entry_future_price, 0.5, "buy")
+            ds.exit2_level = get_target_price_by_percentage(entry_future_price, 0.2, "buy")
             ds.exit3_level = get_target_price_by_percentage(entry_future_price, 0.75, "buy")
         else:
             ds.sl_level = piercing_high
             ds.exit1_level = entry_future_price - piercing_length
-            ds.exit2_level = get_target_price_by_percentage(entry_future_price, 0.5, "sell")
+            ds.exit2_level = get_target_price_by_percentage(entry_future_price, 0.2, "sell")
             ds.exit3_level = get_target_price_by_percentage(entry_future_price, 0.75, "sell")
 
         ds.current_trade = trade
@@ -854,7 +854,7 @@ class VwapPiercingEngine(ILogic):
         # when/whether they fired.
         return {
             "Exit1 (Length of Piercing)": trade.exit1_hit.is_hit,
-            "Exit2 (0.5%)": trade.exit2_hit.is_hit,
+            "Exit2 (0.2%)": trade.exit2_hit.is_hit,
             "Exit3 (0.75%)": trade.exit3_hit.is_hit,
             "Exit4 (Bollinger)": trade.exit4_hit.is_hit,
         }
@@ -865,7 +865,7 @@ class VwapPiercingEngine(ILogic):
     def __log_exit_breaches(self, ds: _DirectionState, was_hit):
         trade = ds.current_trade
         for label, hit_obj in (("Exit1 (Length of Piercing)", trade.exit1_hit),
-                               ("Exit2 (0.5%)", trade.exit2_hit),
+                               ("Exit2 (0.2%)", trade.exit2_hit),
                                ("Exit3 (0.75%)", trade.exit3_hit),
                                ("Exit4 (Bollinger)", trade.exit4_hit)):
             if was_hit[label] or not hit_obj.is_hit:
