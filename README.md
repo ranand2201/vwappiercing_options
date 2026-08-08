@@ -13,8 +13,14 @@ Two ways to run it:
 - **Live** (`executor.py`) — polls live/delayed quotes during market hours, logs each completed trade to the
   `PaperTradeData` tab.
 - **Backtest** (`run_backtest.py`) — replays historical candles for past trading days, logs each detected
-  trade to the `BackTestData` tab. Same pattern-detection engine (`Logic/backtest_engine.py`) also powers
-  `tests/test_pattern_dry_run.py`'s verbose trace, so the two can't drift apart.
+  trade to the `BackTestData` tab. Also powers `tests/test_pattern_dry_run.py`'s verbose trace.
+
+Both run through the exact same state machine, `Logic/piercing_engine.py`'s `VwapPiercingEngine` — a `mode`
+flag (`LIVE`/`BACKTEST`) tells it which it's running as, but every actual trading rule (piercing/reclaim/entry
+conditions, SL and Exit-1..4 level formulas, MAE/MFE, the 14:50 force-exit cutoff) is defined exactly once, so
+changing a rule can't require touching two engines and drifting between them. Only the handful of genuinely
+different touchpoints (how candles/ticks are sourced, real option quotes vs none, threads vs a plain replay
+loop, log wording/destination) branch on mode.
 
 **BUY and SELL setups run as two fully independent state machines** — a piercing in one direction never
 blocks or gets clobbered by the other direction already having a setup or open trade in progress. Both can
@@ -43,10 +49,20 @@ vwappiercing_options/
 ├── interfaces.py                  # LogicVwapPiercingOptionsInterface (ILogicInterface impl)
 ├── run_backtest.py                # backtest runner -- writes to BackTestData, see below
 ├── Logic/
-│   ├── vwap_piercing_options.py   # LogicVwapPiercingOptions -- the live tick-driven engine
-│   ├── backtest_engine.py         # candle-driven day replay -- shared by run_backtest.py and
-│   │                               #   tests/test_pattern_dry_run.py
-│   ├── pattern_rules.py           # pure Piercing/Reclaim/Confirm/window predicates (shared)
+│   ├── piercing_engine.py         # VwapPiercingEngine -- THE state machine (Piercing/Reclaim/
+│   │                               #   Confirm-Entry/SL/Exit-1..4/EOD), used identically by live
+│   │                               #   and backtest via a `mode` (LIVE/BACKTEST) flag. All actual
+│   │                               #   trading-rule logic lives here exactly once; only the
+│   │                               #   handful of genuinely different touchpoints (candle/tick
+│   │                               #   sourcing, real option quotes vs none, threads vs a plain
+│   │                               #   loop, log wording/destination) branch on mode.
+│   ├── vwap_piercing_options.py   # LogicVwapPiercingOptions -- thin LIVE-mode entry point
+│   │                               #   (constructor shape executor.py/interfaces.py expect)
+│   ├── backtest_engine.py         # thin BACKTEST-mode entry point (run_backtest_for_day, plus
+│   │                               #   describe_exit_outcomes/determine_best_case_exit) -- shared
+│   │                               #   by run_backtest.py and tests/test_pattern_dry_run.py
+│   ├── pattern_rules.py           # pure Piercing/Reclaim/Confirm/window predicates, and
+│   │                               #   resolve_front_month_future_symbol (shared)
 │   └── option_selection.py        # premium-nearest-to-band selection (shared w/ tests)
 ├── DataTypes/
 │   └── paper_trade_data.py        # paper_trade_row -- shared row shape for both PaperTradeData
