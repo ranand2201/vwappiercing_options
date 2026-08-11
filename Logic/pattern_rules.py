@@ -14,14 +14,15 @@ from DataTypes.defines import *
 from Utility.utility import generate_monthly_expiry_dates
 
 # New Piercing candidates are only looked for once VWAP has had time to settle (15 min after
-# execution start) and stop being looked for after 14:30 -- an in-progress setup or open trade
-# at that point still runs to its natural conclusion (SL or EOD), only new detection is cut off.
+# execution start) and stop being looked for at PIERCING_CUTOFF_TIME. A setup already in progress
+# (pierced but not yet entered) at that point is abandoned too -- see is_setup_abandon_time_reached
+# -- only an already-open trade (IN_TRADE) runs past this point, until FORCE_EXIT_TIME.
 PIERCING_START_DELAY_MINUTES = 15
-PIERCING_CUTOFF_TIME = "14:30:00"
+PIERCING_CUTOFF_TIME = "14:00:00"
 
 # Any trade still open (SL not yet hit) at this time is force-closed at the prevailing price,
-# regardless of SL/Exit-1..4 state. Pending (not-yet-entered) setups are unaffected -- this only
-# closes an already-open position.
+# regardless of SL/Exit-1..4 state. This is independent of PIERCING_CUTOFF_TIME/setup-abandonment
+# above -- it only ever applies to a trade that has actually entered (IN_TRADE).
 FORCE_EXIT_TIME = "14:50:00"
 
 # A piercing candle only counts if its Close has moved at least this far past VWAP -- filters out
@@ -51,6 +52,16 @@ def is_piercing_window_open(check_time, piercing_start_time):
 def is_force_exit_time_reached(check_time):
     """check_time as a zero-padded 'HH:MM:SS' string (safe to compare lexically)."""
     return check_time >= FORCE_EXIT_TIME
+
+
+def is_setup_abandon_time_reached(check_time):
+    """
+    check_time as a zero-padded 'HH:MM:SS' string. True once PIERCING_CUTOFF_TIME is reached --
+    a setup that has pierced but not yet entered (SEEK_RECLAIM / SEEK_CONFIRM_ENTRY) at this point
+    is given up on and reset, same cutoff as new-piercing detection. Does NOT apply to an
+    already-open trade (IN_TRADE) -- that's FORCE_EXIT_TIME's job, independently.
+    """
+    return check_time >= PIERCING_CUTOFF_TIME
 
 
 def time_of_day(date_time_str):

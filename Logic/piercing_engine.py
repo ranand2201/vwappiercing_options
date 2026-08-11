@@ -127,7 +127,7 @@ class VwapPiercingEngine(ILogic):
         # strategy constants
         self.index_name = "NIFTY"
         self.strike_step = 50
-        self.target_premium_low = 100.0
+        self.target_premium_low = 80.0
         self.target_premium_high = 130.0
         self.bollinger_period = BOLLINGER_PERIOD
         self.bollinger_std_dev = BOLLINGER_STD_DEV
@@ -237,7 +237,11 @@ class VwapPiercingEngine(ILogic):
 
             self.__process_new_candles_live()
 
+            now_str = datetime.now().strftime("%H:%M:%S")
             for ds in self.directions.values():
+                if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY) \
+                        and self.__check_abandon_incomplete_setup(ds, now_str):
+                    continue
                 if ds.state == STATE_SEEK_CONFIRM_ENTRY:
                     self.__check_entry_trigger_live(ds)
                 elif ds.state == STATE_IN_TRADE:
@@ -593,6 +597,10 @@ class VwapPiercingEngine(ILogic):
                 one_min_idx += 1
 
             for direction, ds in self.directions.items():
+                if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY) \
+                        and self.__check_abandon_incomplete_setup(ds, ts):
+                    continue
+
                 if ds.state == STATE_SEEK_PIERCING:
                     self.__check_seek_piercing(ds, row, ts)
 
@@ -712,6 +720,24 @@ class VwapPiercingEngine(ILogic):
     # ------------------------------------------------------------------
     # shared pattern-transition logic (identical for both modes)
     # ------------------------------------------------------------------
+    def __check_abandon_incomplete_setup(self, ds: _DirectionState, ts):
+        """
+        True (and resets ds) if a setup that pierced but hasn't entered yet (SEEK_RECLAIM /
+        SEEK_CONFIRM_ENTRY) is still incomplete at PIERCING_CUTOFF_TIME -- same cutoff as new
+        piercing detection, independent of FORCE_EXIT_TIME (which only applies once IN_TRADE).
+        """
+        if not pattern_rules.is_setup_abandon_time_reached(pattern_rules.time_of_day(ts)):
+            return False
+        msg = f"[{ts}] ({ds.direction}) giving up on incomplete setup (still {ds.state}) at cutoff -- resetting to seek piercing"
+        if self.mode == Mode.LIVE:
+            print(self.logic_name, ":", msg)
+        else:
+            self.__log(msg)
+        ds.state = STATE_SEEK_PIERCING
+        ds.piercing_candle = None
+        ds.reclaim_candle = None
+        return True
+
     def __check_seek_piercing(self, ds: _DirectionState, row, ts):
         window_open = pattern_rules.is_piercing_window_open(pattern_rules.time_of_day(ts), self.piercing_start_time)
         if not window_open:

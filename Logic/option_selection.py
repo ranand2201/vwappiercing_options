@@ -35,7 +35,7 @@ def select_by_premium(lst_contracts, dict_quotes, target_low=100.0, target_high=
     return best_symbol, best_price
 
 
-def select_cheapest_in_band(chain_df, option_type, band_low=100.0, band_high=130.0,
+def select_cheapest_in_band(chain_df, option_type, band_low=80.0, band_high=130.0,
                             symbol_col="symbol", type_col="option_type", ltp_col="ltp"):
     """
     chain_df: a DataFrame as returned by a broker's getOptionChain() (Fyers-style) -- one row per
