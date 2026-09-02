@@ -295,33 +295,32 @@ class VwapPiercingEngine(ILogic):
 
             self.processed_candle_count = len(candle_data)
 
-        # Reclaim is checked against 1-min candles (finer granularity than
-        # candle_interval_minutes) so a reclaim isn't missed/delayed by waiting for the next full
-        # main-interval candle to close -- but still measured against the main interval's own
-        # VWAP (self.last_candle_data), not a separate 1-min VWAP.
-        candle_data_1min = broker.fetchOHLC(self.future_symbol, str_from_date, str_to_date,
-                                            interval="1minute",
-                                            all_data=True, market_type=self.FUTURE_MARKET_TYPE)
-        if candle_data_1min is not None and len(candle_data_1min) > 0:
-            new_rows_1min = candle_data_1min.iloc[self.processed_candle_count_1min:]
-            for _, row in new_rows_1min.iterrows():
+        # Reclaim is checked on the configured main interval (for example 5m), so it stays
+        # aligned with the same candle series used for piercing and VWAP, instead of forcing a
+        # separate 1-minute feed that can create false/early reclaim behavior.
+        candle_data_reclaim = broker.fetchOHLC(self.future_symbol, str_from_date, str_to_date,
+                                              interval=f"{self.candle_interval_minutes}minute",
+                                              all_data=True, market_type=self.FUTURE_MARKET_TYPE)
+        if candle_data_reclaim is not None and len(candle_data_reclaim) > 0:
+            new_rows_reclaim = candle_data_reclaim.iloc[self.processed_candle_count_1min:]
+            for _, row in new_rows_reclaim.iterrows():
                 for ds in self.directions.values():
                     if ds.state == STATE_SEEK_RECLAIM:
                         self.__on_reclaim_1min_close_live(ds, row)
 
-            self.processed_candle_count_1min = len(candle_data_1min)
+            self.processed_candle_count_1min = len(candle_data_reclaim)
 
     def __on_reclaim_1min_close_live(self, ds: _DirectionState, row):
-        # row is a 1-min candle; vwap is looked up from the main-interval series so reclaim is
-        # still measured against the same VWAP the rest of the pattern uses.
+        # row is on the configured main interval (for example 5m); VWAP is still read from the
+        # same main-interval series so reclaim matches the pattern's real reference frame.
         current_vwap = self.__get_latest_vwap()
         if current_vwap is None:
             return
         ts = str(row[DATE_TIME])
         if self.__check_reclaim(ds, row, current_vwap, ts):
             return
-        # Not reclaimed yet -- keep waiting on subsequent 1-min candles rather than abandoning
-        # after just one miss. The piercing candle stays the reference point.
+        # Not reclaimed yet -- keep waiting on subsequent main-interval candles rather than
+        # abandoning after just one miss. The piercing candle stays the reference point.
         print(self.logic_name, f": [{ts}] ({ds.direction}) no reclaim yet, still waiting {self.__fmt_candle(row, current_vwap)}")
 
     def __check_entry_trigger_live(self, ds: _DirectionState):
@@ -565,15 +564,14 @@ class VwapPiercingEngine(ILogic):
         candle_data[VWAP] = [compute_vwap(candle_data, last_loc=i + 1) for i in range(len(candle_data))]
         self.last_candle_data = candle_data
 
-        # Reclaim is checked against 1-min candles (finer granularity than
-        # candle_interval_minutes) so a reclaim isn't missed/delayed by waiting for the next full
-        # main-interval candle to close -- but still measured against the main interval's own
-        # VWAP, not a separate 1-min VWAP. Falls back to the main-interval series (old
-        # per-main-candle behavior) if 1-min data isn't available.
-        candle_data_1min = broker.fetchOHLC(future_symbol, str_from_date, str_to_date,
-                                            interval="1minute", all_data=True, market_type="FUT")
-        if candle_data_1min is None or len(candle_data_1min) == 0:
-            candle_data_1min = candle_data
+        # Reclaim is checked on the configured main interval (for example 5m), not on a
+        # separate 1-minute feed, so reclaim timing matches the same candle cadence as the
+        # piercing and VWAP logic. Fall back to the main-interval series if no matching data exists.
+        candle_data_reclaim = broker.fetchOHLC(future_symbol, str_from_date, str_to_date,
+                                              interval=f"{self.candle_interval_minutes}minute",
+                                              all_data=True, market_type="FUT")
+        if candle_data_reclaim is None or len(candle_data_reclaim) == 0:
+            candle_data_reclaim = candle_data
 
         # Bollinger bands are rolling (causal, only look back), so precomputing over the whole day
         # upfront and indexing by row is equivalent to recomputing fresh at each candle -- no
@@ -581,20 +579,19 @@ class VwapPiercingEngine(ILogic):
         self.upper_band, self.middle_band, self.lower_band = compute_bollinger_bands(
             candle_data, period=self.bollinger_period, std_dev=self.bollinger_std_dev)
 
-        one_min_idx = 0
+        reclaim_row_index = 0
 
         for i in range(len(candle_data)):
             row = candle_data.iloc[i]
             ts = str(row[DATE_TIME])
             self._backtest_row_index = i
 
-            # 1-min candles closing within this main-interval candle's window, consumed in
-            # order -- used for the reclaim check below at finer granularity than
-            # candle_interval_minutes.
+            # Reclaim rows are consumed in the configured candle interval order, keeping the check
+            # aligned with the same main timeframe used by the piercing and VWAP rules.
             sub_rows = []
-            while one_min_idx < len(candle_data_1min) and str(candle_data_1min.iloc[one_min_idx][DATE_TIME]) <= ts:
-                sub_rows.append(candle_data_1min.iloc[one_min_idx])
-                one_min_idx += 1
+            while reclaim_row_index < len(candle_data_reclaim) and str(candle_data_reclaim.iloc[reclaim_row_index][DATE_TIME]) <= ts:
+                sub_rows.append(candle_data_reclaim.iloc[reclaim_row_index])
+                reclaim_row_index += 1
 
             for direction, ds in self.directions.items():
                 if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY) \
