@@ -44,7 +44,8 @@ from enum import Enum
 from BusinessLogic.interfaces.ILogic import *
 from BrokerUtility.pal.utility_manager import *
 from Utility.quotes_utility import *
-from Utility.utility import compute_vwap, compute_bollinger_bands, get_target_price_by_percentage, generate_weekly_expiry_dates
+from Utility.utility import compute_vwap, compute_bollinger_bands, get_target_price_by_percentage, generate_weekly_expiry_dates, \
+    generate_monthly_expiry_dates
 from DataTypes.defines import *
 from ..DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_hit
 from ..UserInterface.adapter.login.login import *
@@ -482,12 +483,16 @@ class VwapPiercingEngine(ILogic):
         atm_strike = round(entry_future_price / self.strike_step) * self.strike_step
         trade_date = datetime.strptime(self.trade_date_str, "%Y-%m-%d")
         weekly_expiry = generate_weekly_expiry_dates(trade_date, 1)[0]
+        # the last weekly expiry of a month IS the monthly expiry, and brokers name it with the
+        # monthly format (Fyers: NIFTY26SEP23200CE, not NIFTY2692923200CE -- the latter is
+        # rejected as "Invalid symbol provided").
+        is_month_expiry = weekly_expiry in generate_monthly_expiry_dates(trade_date, 1)
 
         # probe the ATM strike alone first -- if this whole weekly expiry has since been
         # delisted (confirmed in practice: Fyers returns "Invalid symbol provided" for expired
         # weekly option contracts, not just "no data"), every one of the other ~40 candidates
         # would fail identically. Bail out here instead of grinding through all of them.
-        probe_symbol = self.broker.get_option_name(self.index_name, weekly_expiry, False, str(atm_strike), option_type)
+        probe_symbol = self.broker.get_option_name(self.index_name, weekly_expiry, is_month_expiry, str(atm_strike), option_type)
         probe_price = self.__historical_option_close_near(probe_symbol, ts)
         if probe_price is None:
             self.__log(f"[{ts}] No historical option data available for expiry {weekly_expiry} "
@@ -500,7 +505,7 @@ class VwapPiercingEngine(ILogic):
             if offset == 0:
                 symbol, price = probe_symbol, probe_price  # already fetched above, don't refetch
             else:
-                symbol = self.broker.get_option_name(self.index_name, weekly_expiry, False, str(strike), option_type)
+                symbol = self.broker.get_option_name(self.index_name, weekly_expiry, is_month_expiry, str(strike), option_type)
                 price = self.__historical_option_close_near(symbol, ts)
             if price is None or price <= 0:
                 continue
