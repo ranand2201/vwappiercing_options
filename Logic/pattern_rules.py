@@ -33,9 +33,19 @@ PIERCING_MIN_VWAP_GAP = 6
 # the candle is genuinely piercing through rather than opening right on top of VWAP.
 PIERCING_MIN_OPEN_VWAP_GAP = 5
 
-# During SEEK_CONFIRM_ENTRY, entry only fires once price has cleared back through VWAP by at
+# During SEEK_CONFIRM_ENTRY, entry only fires once the candle has closed back through VWAP by at
 # least this much -- a bare crossing right on the VWAP line is treated as noise, not a real entry.
 ENTRY_MIN_VWAP_GAP = 5
+
+# The two legs after the Piercing candle each run on their own fixed timeframe, independent of the
+# configurable main/piercing candle interval:
+#   Reclaim  -- 5-min candles. A reclaim is a genuine rejection back across VWAP, so it needs a
+#               slow enough candle to mean something; a 1-min close back across the line is mostly
+#               noise and fires far too readily.
+#   Entry    -- 1-min candles. Once the reclaim has printed, the trigger wants the fastest
+#               confirmation available so entry isn't delayed waiting for a slower candle to close.
+RECLAIM_CANDLE_INTERVAL_MINUTES = 5
+ENTRY_CANDLE_INTERVAL_MINUTES = 1
 
 
 def compute_piercing_start_time(execution_start_time):
@@ -76,6 +86,10 @@ def piercing_direction(row):
     side, and the Close has cleared VWAP on the other side by at least PIERCING_MIN_VWAP_GAP --
     a marginal open or close right on the VWAP line is treated as noise, not a real piercing.
     """
+    body = abs(float(row[CLOSE_PRICE]) - float(row[OPEN_PRICE]))
+    top_wick = float(row[HIGH_PRICE]) - max(float(row[OPEN_PRICE]), float(row[CLOSE_PRICE]))
+    if body <= top_wick:
+        return None
     if row[OPEN_PRICE] < row[VWAP] - PIERCING_MIN_OPEN_VWAP_GAP and row[CLOSE_PRICE] > row[VWAP] + PIERCING_MIN_VWAP_GAP:
         return "BUY"
     if row[OPEN_PRICE] > row[VWAP] + PIERCING_MIN_OPEN_VWAP_GAP and row[CLOSE_PRICE] < row[VWAP] - PIERCING_MIN_VWAP_GAP:
@@ -84,19 +98,48 @@ def piercing_direction(row):
 
 
 def is_reclaimed(row, vwap, direction):
-    """True if this candle's close lands back on the opposite side of VWAP from the piercing close."""
+    """
+    True if this RECLAIM_CANDLE_INTERVAL_MINUTES candle's close lands back on the opposite side of
+    VWAP from the piercing close -- BUY: closes below VWAP; SELL: closes above VWAP. No minimum
+    gap here (unlike the piercing and entry legs): the reclaim only has to get back across the
+    line, not clear it by a margin.
+    """
     return (row[CLOSE_PRICE] < vwap) if direction == "BUY" else (row[CLOSE_PRICE] > vwap)
 
 
 def is_vwap_reentry_triggered(check_price, vwap, direction):
     """
-    The entry trigger: once Reclaim is confirmed, entry fires when price crosses back through
-    VWAP in the original piercing direction by at least ENTRY_MIN_VWAP_GAP (BUY: back above VWAP;
-    SELL: back below VWAP). check_price is a candle's Close for the backtest/dry-run
-    (candle-driven), or the live LTP for the tick-driven live engine -- same predicate either way.
+    The entry trigger: once Reclaim is confirmed, entry fires when an
+    ENTRY_CANDLE_INTERVAL_MINUTES candle closes back through VWAP in the original piercing
+    direction by at least ENTRY_MIN_VWAP_GAP (BUY: closes above VWAP; SELL: closes below VWAP).
+    check_price is that 1-min candle's Close in both modes.
     """
     return (check_price > vwap + ENTRY_MIN_VWAP_GAP) if direction == "BUY" \
         else (check_price < vwap - ENTRY_MIN_VWAP_GAP)
+
+
+def candle_close_time(candle_ts, interval_minutes):
+    """
+    A candle's close time, as a datetime, from its start timestamp ('YYYY-MM-DD HH:MM:SS') and its
+    interval. Broker candle timestamps label the candle's START (confirmed against Fyers' history
+    API, whose epoch stamps are the bar open), so a 5-min candle stamped 10:35 has not actually
+    closed -- and so isn't knowable -- until 10:40.
+    """
+    return datetime.strptime(candle_ts, "%Y-%m-%d %H:%M:%S") + timedelta(minutes=interval_minutes)
+
+
+def has_closed_at_or_after(candle_ts, interval_minutes, reference_ts, reference_interval_minutes):
+    """
+    True if the candle starting at candle_ts closes no earlier than the reference candle does,
+    i.e. it isn't knowable before the reference candle is. Keeps the pattern's legs in real
+    chronological order now that they run on three different timeframes: a 5-min Reclaim candle
+    must not be one that was still forming inside the Piercing candle, and a 1-min entry candle
+    must not be one that closed before the Reclaim candle confirmed. A tie (e.g. the 10:39 1-min
+    candle and the 10:35 5-min candle, both closing at 10:40) is allowed -- both are known at the
+    same instant, so acting on the pair right then is legitimate in live and backtest alike.
+    """
+    return candle_close_time(candle_ts, interval_minutes) >= \
+        candle_close_time(reference_ts, reference_interval_minutes)
 
 
 def _is_in_last_week_of_month(trade_date):

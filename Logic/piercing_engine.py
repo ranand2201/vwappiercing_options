@@ -21,6 +21,16 @@ BUY and SELL setups are tracked as two fully independent state machines (see
 _DirectionState) so a piercing in one direction is never blocked or lost
 while the other direction already has a setup/trade in progress.
 
+The three legs deliberately run on three different timeframes, and both
+modes drive them from the same candle series: Piercing on the configurable
+main interval (Config.candle_interval), Reclaim on 5-min candles, and the
+entry trigger on 1-min candles (see pattern_rules' RECLAIM_/ENTRY_
+CANDLE_INTERVAL_MINUTES). Because those candles close at different times,
+the sub-candle legs are fed through the state machine in true close-time
+order with an explicit ordering guard, so a Reclaim can never be taken from
+a candle still forming inside the Piercing candle, nor an entry from a
+1-min candle that closed before the Reclaim confirmed.
+
 SL is the ONLY real exit -- Exit-1..4 (Length-of-Piercing, 0.2%, 0.75%,
 Bollinger) are all parallel hypotheses tracked for comparison only; breaching
 one is logged but doesn't close the trade. Any trade still open at 14:50 is
@@ -79,7 +89,7 @@ class _DirectionState:
         self.state = STATE_SEEK_PIERCING
         self.piercing_candle = None
         self.reclaim_candle = None
-        # 1-min reclaim candles carry no VWAP of their own -- the main-interval VWAP they were
+        # 5-min reclaim candles carry no VWAP of their own -- the main-interval VWAP they were
         # checked against is tracked separately here.
         self.reclaim_vwap = 0.0
         # LIVE only: ticks are polled every few seconds, but the periodic waiting-for-entry/
@@ -171,8 +181,10 @@ class VwapPiercingEngine(ILogic):
         self.candle_interval_minutes = int(self.config_data.candle_interval)
         self.piercing_start_time = pattern_rules.compute_piercing_start_time(self.execution_start_time)
 
+        # one cursor per series: main-interval (piercing), 5-min (reclaim), 1-min (entry).
         self.processed_candle_count = 0
-        self.processed_candle_count_1min = 0
+        self.processed_candle_count_reclaim = 0
+        self.processed_candle_count_entry = 0
 
         self.pre_requisite_thread = threading.Thread(target=self.pre_requisite_thread_handler)
         self.execute_thread = threading.Thread(target=self.execute)
@@ -242,9 +254,10 @@ class VwapPiercingEngine(ILogic):
                 if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY) \
                         and self.__check_abandon_incomplete_setup(ds, now_str):
                     continue
-                if ds.state == STATE_SEEK_CONFIRM_ENTRY:
-                    self.__check_entry_trigger_live(ds)
-                elif ds.state == STATE_IN_TRADE:
+                # Reclaim and entry are both candle-close-driven (5-min / 1-min) and are handled
+                # in __process_new_candles_live above; only the exit side still needs per-tick
+                # polling, since SL/Exit-1..4 are level breaches that can happen intrabar.
+                if ds.state == STATE_IN_TRADE:
                     self.__check_exit_hits_live(ds)
 
             time.sleep(3)
@@ -295,53 +308,42 @@ class VwapPiercingEngine(ILogic):
 
             self.processed_candle_count = len(candle_data)
 
-        # Reclaim is checked against 1-min candles (finer granularity than
-        # candle_interval_minutes) so a reclaim isn't missed/delayed by waiting for the next full
-        # main-interval candle to close -- but still measured against the main interval's own
-        # VWAP (self.last_candle_data), not a separate 1-min VWAP.
-        candle_data_1min = broker.fetchOHLC(self.future_symbol, str_from_date, str_to_date,
-                                            interval="1minute",
-                                            all_data=True, market_type=self.FUTURE_MARKET_TYPE)
-        if candle_data_1min is not None and len(candle_data_1min) > 0:
-            new_rows_1min = candle_data_1min.iloc[self.processed_candle_count_1min:]
-            for _, row in new_rows_1min.iterrows():
-                for ds in self.directions.values():
-                    if ds.state == STATE_SEEK_RECLAIM:
-                        self.__on_reclaim_1min_close_live(ds, row)
-
-            self.processed_candle_count_1min = len(candle_data_1min)
-
-    def __on_reclaim_1min_close_live(self, ds: _DirectionState, row):
-        # row is a 1-min candle; vwap is looked up from the main-interval series so reclaim is
-        # still measured against the same VWAP the rest of the pattern uses.
-        current_vwap = self.__get_latest_vwap()
-        if current_vwap is None:
-            return
-        ts = str(row[DATE_TIME])
-        if self.__check_reclaim(ds, row, current_vwap, ts):
-            return
-        # Not reclaimed yet -- keep waiting on subsequent 1-min candles rather than abandoning
-        # after just one miss. The piercing candle stays the reference point.
-        print(self.logic_name, f": [{ts}] ({ds.direction}) no reclaim yet, still waiting {self.__fmt_candle(row, current_vwap)}")
-
-    def __check_entry_trigger_live(self, ds: _DirectionState):
-        quote_data = self.quotes_utility.get_quote_data()
-        if self.future_symbol not in quote_data:
-            return
-        ltp = quote_data[self.future_symbol].ltp
-        current_vwap = self.__get_latest_vwap()
-        if current_vwap is None:
-            return
-        now_str = datetime.now().strftime("%H:%M:%S")
-        triggered = pattern_rules.is_vwap_reentry_triggered(ltp, current_vwap, ds.direction)
-        if triggered:
-            # a real event -- always print, not subject to the once-per-candle throttle below.
-            print(self.logic_name, f": [{now_str}] ({ds.direction}) waiting for entry: LTP={ltp} vs VWAP={current_vwap:.2f} -> TRIGGERED")
+        # Reclaim runs on 5-min candles and the entry trigger on 1-min candles, both independent
+        # of candle_interval_minutes -- but both still measured against the main interval's own
+        # session VWAP (self.last_candle_data), not a separate per-series VWAP. When the main
+        # interval already IS 5 min, the series just fetched above is the reclaim series; reuse it
+        # rather than asking the broker for the same candles twice.
+        if self.candle_interval_minutes == pattern_rules.RECLAIM_CANDLE_INTERVAL_MINUTES:
+            candle_data_reclaim = candle_data
         else:
-            self.__log_once_per_candle(ds, f": [{now_str}] ({ds.direction}) waiting for entry: LTP={ltp} vs VWAP={current_vwap:.2f}")
-        if not triggered:
+            candle_data_reclaim = broker.fetchOHLC(
+                self.future_symbol, str_from_date, str_to_date,
+                interval=f"{pattern_rules.RECLAIM_CANDLE_INTERVAL_MINUTES}minute",
+                all_data=True, market_type=self.FUTURE_MARKET_TYPE)
+        candle_data_entry = broker.fetchOHLC(
+            self.future_symbol, str_from_date, str_to_date,
+            interval=f"{pattern_rules.ENTRY_CANDLE_INTERVAL_MINUTES}minute",
+            all_data=True, market_type=self.FUTURE_MARKET_TYPE)
+
+        new_reclaim_rows, new_entry_rows = [], []
+        if candle_data_reclaim is not None and len(candle_data_reclaim) > 0:
+            new_reclaim_rows = [row for _, row in
+                                candle_data_reclaim.iloc[self.processed_candle_count_reclaim:].iterrows()]
+            self.processed_candle_count_reclaim = len(candle_data_reclaim)
+        if candle_data_entry is not None and len(candle_data_entry) > 0:
+            new_entry_rows = [row for _, row in
+                              candle_data_entry.iloc[self.processed_candle_count_entry:].iterrows()]
+            self.processed_candle_count_entry = len(candle_data_entry)
+
+        # note the cursors advance above regardless of any direction's state -- sub-candles that
+        # elapsed while nothing was waiting on them are in the past and must not be replayed into
+        # a setup that pierces later.
+        current_vwap = self.__get_latest_vwap()
+        if current_vwap is None:
             return
-        self.__enter_trade(ds, ltp, now_str)
+        for ds in self.directions.values():
+            if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY):
+                self.__drive_setup_sub_candles(ds, new_reclaim_rows, new_entry_rows, current_vwap)
 
     def __get_latest_vwap(self):
         if self.last_candle_data is None or len(self.last_candle_data) == 0:
@@ -565,15 +567,26 @@ class VwapPiercingEngine(ILogic):
         candle_data[VWAP] = [compute_vwap(candle_data, last_loc=i + 1) for i in range(len(candle_data))]
         self.last_candle_data = candle_data
 
-        # Reclaim is checked against 1-min candles (finer granularity than
-        # candle_interval_minutes) so a reclaim isn't missed/delayed by waiting for the next full
-        # main-interval candle to close -- but still measured against the main interval's own
-        # VWAP, not a separate 1-min VWAP. Falls back to the main-interval series (old
-        # per-main-candle behavior) if 1-min data isn't available.
-        candle_data_1min = broker.fetchOHLC(future_symbol, str_from_date, str_to_date,
-                                            interval="1minute", all_data=True, market_type="FUT")
-        if candle_data_1min is None or len(candle_data_1min) == 0:
-            candle_data_1min = candle_data
+        # Reclaim runs on 5-min candles and the entry trigger on 1-min candles, both independent
+        # of candle_interval_minutes -- but both still measured against the main interval's own
+        # session VWAP, not a separate per-series VWAP. Either falls back to the main-interval
+        # series if that resolution isn't available for this day; when the main interval already
+        # IS 5 min, the reclaim series is the main series, so don't refetch it.
+        if self.candle_interval_minutes == pattern_rules.RECLAIM_CANDLE_INTERVAL_MINUTES:
+            candle_data_reclaim = candle_data
+        else:
+            candle_data_reclaim = broker.fetchOHLC(
+                future_symbol, str_from_date, str_to_date,
+                interval=f"{pattern_rules.RECLAIM_CANDLE_INTERVAL_MINUTES}minute",
+                all_data=True, market_type="FUT")
+            if candle_data_reclaim is None or len(candle_data_reclaim) == 0:
+                candle_data_reclaim = candle_data
+        candle_data_entry = broker.fetchOHLC(
+            future_symbol, str_from_date, str_to_date,
+            interval=f"{pattern_rules.ENTRY_CANDLE_INTERVAL_MINUTES}minute",
+            all_data=True, market_type="FUT")
+        if candle_data_entry is None or len(candle_data_entry) == 0:
+            candle_data_entry = candle_data
 
         # Bollinger bands are rolling (causal, only look back), so precomputing over the whole day
         # upfront and indexing by row is equivalent to recomputing fresh at each candle -- no
@@ -581,20 +594,26 @@ class VwapPiercingEngine(ILogic):
         self.upper_band, self.middle_band, self.lower_band = compute_bollinger_bands(
             candle_data, period=self.bollinger_period, std_dev=self.bollinger_std_dev)
 
-        one_min_idx = 0
+        reclaim_idx, entry_idx = 0, 0
 
         for i in range(len(candle_data)):
             row = candle_data.iloc[i]
             ts = str(row[DATE_TIME])
             self._backtest_row_index = i
 
-            # 1-min candles closing within this main-interval candle's window, consumed in
-            # order -- used for the reclaim check below at finer granularity than
-            # candle_interval_minutes.
-            sub_rows = []
-            while one_min_idx < len(candle_data_1min) and str(candle_data_1min.iloc[one_min_idx][DATE_TIME]) <= ts:
-                sub_rows.append(candle_data_1min.iloc[one_min_idx])
-                one_min_idx += 1
+            # The 5-min (reclaim) and 1-min (entry) candles falling within this main-interval
+            # candle's window, each consumed in order. They're merged and ordered by close time
+            # inside __drive_setup_sub_candles, which is also what stops a sub-candle being used
+            # before the leg it depends on has actually confirmed.
+            reclaim_rows, entry_rows = [], []
+            while reclaim_idx < len(candle_data_reclaim) \
+                    and str(candle_data_reclaim.iloc[reclaim_idx][DATE_TIME]) <= ts:
+                reclaim_rows.append(candle_data_reclaim.iloc[reclaim_idx])
+                reclaim_idx += 1
+            while entry_idx < len(candle_data_entry) \
+                    and str(candle_data_entry.iloc[entry_idx][DATE_TIME]) <= ts:
+                entry_rows.append(candle_data_entry.iloc[entry_idx])
+                entry_idx += 1
 
             for direction, ds in self.directions.items():
                 if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY) \
@@ -604,14 +623,11 @@ class VwapPiercingEngine(ILogic):
                 if ds.state == STATE_SEEK_PIERCING:
                     self.__check_seek_piercing(ds, row, ts)
 
-                elif ds.state == STATE_SEEK_RECLAIM:
-                    self.__check_reclaim_backtest(ds, row, sub_rows, ts)
-
-                elif ds.state == STATE_SEEK_CONFIRM_ENTRY:
-                    self.__check_confirm_entry_backtest(ds, row, sub_rows, ts)
-
                 elif ds.state == STATE_IN_TRADE:
                     self.__check_in_trade_backtest(ds, row, ts)
+
+                if ds.state in (STATE_SEEK_RECLAIM, STATE_SEEK_CONFIRM_ENTRY):
+                    self.__drive_setup_sub_candles(ds, reclaim_rows, entry_rows, float(row[VWAP]))
 
         # end of day: any direction still IN_TRADE (SL never hit) gets its exit5_eod stamped with
         # the day's last close, mirroring the live engine's EOD finalize.
@@ -629,31 +645,6 @@ class VwapPiercingEngine(ILogic):
                           f"{last_close} ({self.__fmt_option_price(trade.exit5_eod.option_price)})")
 
         return self.results, future_symbol, STATUS_OK
-
-    def __check_reclaim_backtest(self, ds: _DirectionState, row, sub_rows, ts):
-        for r in sub_rows:
-            if self.__check_reclaim(ds, r, row[VWAP], str(r[DATE_TIME])):
-                return
-        # Not reclaimed yet -- keep waiting on subsequent candles rather than abandoning after
-        # just one miss. The piercing candle stays the reference point.
-        self.__log(f"[{ts}] ({ds.direction}) no reclaim yet, still waiting {self.__fmt_candle(row)}")
-
-    def __check_confirm_entry_backtest(self, ds: _DirectionState, row, sub_rows, ts):
-        # entry fires when this candle's Close crosses back through VWAP in the piercing
-        # direction (BUY: back above VWAP; SELL: back below VWAP) -- no invalidation here, the
-        # setup just keeps waiting, candle after candle, until this happens or EOD.
-        triggered = pattern_rules.is_vwap_reentry_triggered(row[CLOSE_PRICE], row[VWAP], ds.direction)
-        self.__log(f"[{ts}] ({ds.direction}) waiting for entry: close={row[CLOSE_PRICE]} vs VWAP={row[VWAP]:.2f} "
-                  f"{self.__fmt_candle(row)} {'-> TRIGGERED' if triggered else ''}")
-        if not triggered:
-            return
-
-        # entry price itself is read from the 1-min candle aligned with this main-interval
-        # candle's close (finer-grained than the main-interval Close), same source reclaim uses
-        # -- everything else about this trade (timestamp, confirm_candle, etc.) stays keyed to
-        # the main-interval candle.
-        entry_price = float(sub_rows[-1][CLOSE_PRICE]) if sub_rows else float(row[CLOSE_PRICE])
-        self.__enter_trade(ds, entry_price, ts, main_row=row)
 
     def __check_in_trade_backtest(self, ds: _DirectionState, row, ts):
         trade = ds.current_trade
@@ -728,11 +719,8 @@ class VwapPiercingEngine(ILogic):
         """
         if not pattern_rules.is_setup_abandon_time_reached(pattern_rules.time_of_day(ts)):
             return False
-        msg = f"[{ts}] ({ds.direction}) giving up on incomplete setup (still {ds.state}) at cutoff -- resetting to seek piercing"
-        if self.mode == Mode.LIVE:
-            print(self.logic_name, ":", msg)
-        else:
-            self.__log(msg)
+        self.__log_event(f"[{ts}] ({ds.direction}) giving up on incomplete setup (still {ds.state}) "
+                         f"at cutoff -- resetting to seek piercing")
         ds.state = STATE_SEEK_PIERCING
         ds.piercing_candle = None
         ds.reclaim_candle = None
@@ -766,6 +754,96 @@ class VwapPiercingEngine(ILogic):
         else:
             self.__log(f"[{ts}] ({ds.direction}) PIERCING {self.__fmt_candle(row)}")
 
+    def __drive_setup_sub_candles(self, ds: _DirectionState, reclaim_rows, entry_rows, vwap):
+        """
+        Feeds one batch of 5-min (Reclaim) and 1-min (entry) candles through the
+        SEEK_RECLAIM -> SEEK_CONFIRM_ENTRY -> entry legs, in true close-time order rather than
+        series by series. That ordering matters: a Reclaim printing part-way through the batch
+        has to be able to be followed by an entry on a later 1-min candle from the SAME batch,
+        which a series-at-a-time pass would either miss or take out of order. `vwap` is the
+        main-interval session VWAP both legs are measured against -- neither sub-series carries
+        a VWAP column of its own.
+
+        Shared verbatim by both modes: LIVE passes the candles that are new since the last poll,
+        BACKTEST the ones falling inside the current main-interval candle.
+        """
+        reclaim_interval = pattern_rules.RECLAIM_CANDLE_INTERVAL_MINUTES
+        entry_interval = pattern_rules.ENTRY_CANDLE_INTERVAL_MINUTES
+
+        # Reclaim events are listed first so that Python's stable sort breaks a close-time tie
+        # (e.g. the 10:39 1-min candle and the 10:35 5-min candle both close at 10:40) in favour
+        # of the Reclaim -- matching has_closed_at_or_after, which allows that same tie for entry.
+        events = [(pattern_rules.candle_close_time(str(r[DATE_TIME]), reclaim_interval), reclaim_interval, r)
+                  for r in reclaim_rows]
+        events += [(pattern_rules.candle_close_time(str(r[DATE_TIME]), entry_interval), entry_interval, r)
+                   for r in entry_rows]
+        events.sort(key=lambda event: event[0])
+
+        for _, interval, row in events:
+            ts = str(row[DATE_TIME])
+            if interval == reclaim_interval and ds.state == STATE_SEEK_RECLAIM:
+                # a 5-min candle still forming inside the piercing candle isn't knowable yet --
+                # only candles that close at or after the piercing candle did can reclaim it.
+                piercing_ts = str(ds.piercing_candle[DATE_TIME])
+                if not pattern_rules.has_closed_at_or_after(ts, reclaim_interval, piercing_ts,
+                                                            self.candle_interval_minutes):
+                    continue
+                # when the main interval IS 5 min the two series are the same one, so the
+                # piercing candle itself shows up here as a reclaim candidate -- its own close is
+                # what defined the piercing, it can't also be the reclaim of it. (The piercing and
+                # reclaim predicates are mutually exclusive anyway, so this never actually fires
+                # today; it's here so that stays true if either predicate is ever loosened.)
+                if ts == piercing_ts and reclaim_interval == self.candle_interval_minutes:
+                    continue
+                if self.__check_reclaim(ds, row, vwap, ts):
+                    continue
+                # Not reclaimed yet -- keep waiting on subsequent 5-min candles rather than
+                # abandoning after just one miss. The piercing candle stays the reference point.
+                self.__log_event(f"[{ts}] ({ds.direction}) no reclaim yet, still waiting "
+                                 f"{self.__fmt_candle(row, vwap)}")
+            elif interval == entry_interval and ds.state == STATE_SEEK_CONFIRM_ENTRY:
+                # likewise, a 1-min candle that closed before the reclaim candle confirmed can't
+                # be the entry trigger for it.
+                if not pattern_rules.has_closed_at_or_after(ts, entry_interval,
+                                                            str(ds.reclaim_candle[DATE_TIME]),
+                                                            reclaim_interval):
+                    continue
+                self.__check_confirm_entry(ds, row, vwap, ts)
+
+    def __check_confirm_entry(self, ds: _DirectionState, row, vwap, ts):
+        """
+        The entry leg, on a single 1-min candle: entry fires when its Close crosses back through
+        VWAP in the piercing direction (BUY: back above VWAP; SELL: back below VWAP). There's no
+        invalidation here -- the setup just keeps waiting, 1-min candle after 1-min candle, until
+        this happens, the PIERCING_CUTOFF_TIME abandon kicks in, or the day ends.
+        """
+        close_price = float(row[CLOSE_PRICE])
+        triggered = pattern_rules.is_vwap_reentry_triggered(close_price, vwap, ds.direction)
+        self.__log_event(f"[{ts}] ({ds.direction}) waiting for entry: 1min close={close_price} "
+                         f"vs VWAP={vwap:.2f} {self.__fmt_candle(row, vwap)}"
+                         f"{' -> TRIGGERED' if triggered else ''}")
+        if not triggered:
+            return
+
+        # LIVE fills at the prevailing LTP -- the 1-min close is what *triggers* the entry, but by
+        # the time it's acted on the tradable price is the live one, so that's what gets logged as
+        # the entry price. BACKTEST has no intrabar ticks, so the triggering candle's own Close
+        # stands in for it.
+        entry_price = close_price
+        if self.mode == Mode.LIVE:
+            quote_data = self.quotes_utility.get_quote_data()
+            if self.future_symbol in quote_data:
+                entry_price = quote_data[self.future_symbol].ltp
+        self.__enter_trade(ds, entry_price, ts, entry_row=row, vwap=vwap)
+
+    def __log_event(self, message):
+        """Pattern-event logging to whichever sink this mode uses -- stdout for LIVE, log_fn for
+        BACKTEST."""
+        if self.mode == Mode.LIVE:
+            print(self.logic_name, ":", message)
+        else:
+            self.__log(message)
+
     def __check_reclaim(self, ds: _DirectionState, row, vwap, ts):
         """True (and transitions state) if this row reclaims; caller logs the miss case."""
         if not pattern_rules.is_reclaimed(row, vwap, ds.direction):
@@ -773,14 +851,10 @@ class VwapPiercingEngine(ILogic):
         ds.reclaim_candle = row
         ds.reclaim_vwap = vwap
         ds.state = STATE_SEEK_CONFIRM_ENTRY
-        msg = f"[{ts}] ({ds.direction}) RECLAIM {self.__fmt_candle(row, vwap)}"
-        if self.mode == Mode.LIVE:
-            print(self.logic_name, ":", msg)
-        else:
-            self.__log(msg)
+        self.__log_event(f"[{ts}] ({ds.direction}) RECLAIM {self.__fmt_candle(row, vwap)}")
         return True
 
-    def __enter_trade(self, ds: _DirectionState, entry_future_price, ts, main_row=None):
+    def __enter_trade(self, ds: _DirectionState, entry_future_price, ts, entry_row, vwap):
         option_symbol, option_price = "", 0.0
         option_type = "CE" if ds.direction == "BUY" else "PE"
         if self.mode == Mode.LIVE:
@@ -813,11 +887,10 @@ class VwapPiercingEngine(ILogic):
         trade.trade_type = ds.direction
         trade.piercing_candle = self.__to_snapshot(ds.piercing_candle)
         trade.reclaim_candle = self.__to_snapshot(ds.reclaim_candle, ds.reclaim_vwap)
-        if self.mode == Mode.LIVE:
-            trade.confirm_candle = candle_snapshot(timestamp=ts, open=entry_future_price, high=entry_future_price,
-                                                   low=entry_future_price, close=entry_future_price, vwap=0.0)
-        else:
-            trade.confirm_candle = self.__to_snapshot(main_row)
+        # the confirm candle is the 1-min candle whose close triggered the entry, in both modes
+        # -- stamped with the main-interval VWAP it was measured against, since a 1-min candle
+        # carries no VWAP of its own.
+        trade.confirm_candle = self.__to_snapshot(entry_row, vwap)
         trade.entry_future_price = entry_future_price
         trade.entry_option_price = option_price
         trade.entry_timestamp = ts

@@ -23,9 +23,20 @@ class UserInterfacePaperTrade:
             # append_table()'s "find the last table and append after it" heuristic drifts further
             # right on every call once any row's data doesn't start at column A (confirmed in
             # practice -- each botched write becomes the next call's "table", compounding the
-            # drift run after run). Find the next empty row from column A's own populated count
-            # instead, and write there explicitly, so every row always starts at column A.
-            next_row = len(self.gworksheet_paper_trade.get_col(1, include_tailing_empty=False)) + 1
+            # drift run after run). Find the next empty row explicitly instead, so every row
+            # always starts at column A.
+            #
+            # Scan whole rows, not just column A: the header's second row is blank in column A
+            # (its per-candle "Time Stamp/O/H/L/C/VWAP" sub-labels start further right), so a
+            # column-A count sees only 1 populated row and sends the first trade on top of that
+            # sub-header. Floor at row 3, the first real data row.
+            rows = self.gworksheet_paper_trade.get_all_values()
+            last_populated_row = max(
+                (row_number for row_number, row in enumerate(rows, start=1)
+                 if any(str(cell).strip() for cell in row)),
+                default=0,
+            )
+            next_row = max(last_populated_row + 1, 3)
             self.gworksheet_paper_trade.update_values(crange=f"A{next_row}", values=[values], extend=True)
         except:
             print("Exception while writing paper trade row to PaperTradeData")
