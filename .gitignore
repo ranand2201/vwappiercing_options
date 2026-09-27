@@ -1,8 +1,10 @@
 # vwappiercing_options project-specific
 # Service-account / broker credential keys must never be committed. This package is always
-# passed one via --key at runtime (e.g. bankniftyorb-*.json, which lives outside this repo) --
-# nothing here legitimately needs a tracked .json file.
+# passed one via --key at runtime (e.g. bankniftyorb-*.json, which lives outside this repo).
 *.json
+# ...except the strategy's own tunable-parameter config, which is a real tracked source file (see
+# Config/config_loader.py) -- not a credential, and needs to be committed for everyone to share.
+!Config/strategy_config.json
 
 # Broker log output (zebumynt_utitlity writes to <cwd>/Logs/)
 Logs/

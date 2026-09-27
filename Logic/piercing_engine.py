@@ -40,6 +40,7 @@ force-closed at the prevailing price regardless of SL/Exit-1..4 state.
 """
 import threading
 import time
+import traceback
 from datetime import datetime, date, timedelta
 from enum import Enum
 
@@ -55,8 +56,19 @@ from ..DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_
 from ..UserInterface.adapter.login.login import *
 from ..UserInterface.adapter.config.config import *
 from ..UserInterface.gsheet.paper_trade.paper_trade import *
+from ..Config.config_loader import load_config
 from . import pattern_rules
 from .option_selection import select_by_premium, select_cheapest_in_band
+
+# Which paper_trade_row exit_hit field + display label each Config/strategy_config.json
+# "target_exit" value maps to. None/unrecognized -> SL is the only real exit (see
+# VwapPiercingEngine.__init__ / __configured_real_exit_hit).
+TARGET_EXIT_FIELD_MAP = {
+    "exit1": ("exit1_hit", "Exit1"),
+    "exit2": ("exit2_hit", "Exit2"),
+    "exit3": ("exit3_hit", "Exit3"),
+    "exit4": ("exit4_hit", "Exit4"),
+}
 
 
 class Mode(Enum):
@@ -72,24 +84,20 @@ STATE_IN_TRADE = "IN_TRADE"
 STATUS_NO_DATA = "no_data"
 STATUS_OK = "ok"
 
-DAY_START_TIME = "09:15:00"
-BOLLINGER_PERIOD = 20
-# LIVE test mode (executor.py --test_mode true --date ...): the simulated clock starts at this
-# time on the test date and runs in fast mode: each pass of the execute loop moves it forward by
-# TEST_MODE_STEP_SECONDS instead of sleeping, so a whole day replays in seconds. One minute per
-# pass matches the 1-min candles prices are taken from, so no candle is skipped.
-TEST_MODE_START_TIME = "09:16:15"
-TEST_MODE_STEP_SECONDS = 60
-BOLLINGER_STD_DEV = 2
+# Day start, test-mode clock, historical-option-lookup pacing, and the Bollinger settings are all
+# tunable trading parameters now -- see Config/strategy_config.json, loaded once into
+# self.day_start_time / self.test_mode_start_time / self.test_mode_step_seconds /
+# self.historical_option_lookup_delay_seconds / self.bollinger_period / self.bollinger_std_dev in
+# __init__. (LIVE test mode, executor.py --test_mode true --date ...: the simulated clock starts
+# at test_mode_start_time on the test date and runs in fast mode, each pass of the execute loop
+# moving it forward by test_mode_step_seconds instead of sleeping, so a whole day replays in
+# seconds -- one minute per pass matches the 1-min candles prices are taken from, so no candle is
+# skipped.)
 
 # Fyers' real option-chain-query symbol for each index's underlying (confirmed via
 # test_fyers_option_chain.py against the live API: "NSE:NIFTY50-INDEX"). getOptionChain()
 # prepends the exchange itself, so only the bare symbol goes here.
 CHAIN_UNDERLYING_SYMBOL = {"NIFTY": "NIFTY50-INDEX", "BANKNIFTY": "NIFTYBANK-INDEX"}
-
-# BACKTEST-only historical option lookups are per-symbol calls (no batched chain-quote
-# equivalent exists for a past date) -- pace them to stay under the broker's rate limit.
-HISTORICAL_OPTION_LOOKUP_DELAY_SECONDS = 0.5
 
 
 class _DirectionState:
@@ -113,6 +121,9 @@ class _DirectionState:
 
         self.current_trade: paper_trade_row = None
         self.option_symbol = ""
+        # LIVE real trading only: the quantity a real BUY order for this position was placed for,
+        # so the exit's real SELL order squares off exactly what was actually bought.
+        self.order_quantity = 0
         self.sl_level = 0.0
         self.exit1_level = 0.0
         self.exit2_level = 0.0
@@ -148,13 +159,40 @@ class VwapPiercingEngine(ILogic):
         self.mode = mode
         self.logic_name = "LogicVwapPiercingOptions"
 
+        # Config/strategy_config.json -- the single source of truth for every tunable trading
+        # parameter, shared by LIVE and BACKTEST alike (see Config/config_loader.py). Applied to
+        # pattern_rules' module-level constants too, so a config change can't apply to only one
+        # of the piercing/reclaim/entry predicates and the engine that drives them.
+        self.cfg = load_config()
+        pattern_rules.configure(self.cfg)
+
         # strategy constants
-        self.index_name = "NIFTY"
-        self.strike_step = 50
-        self.target_premium_low = 80.0
-        self.target_premium_high = 130.0
-        self.bollinger_period = BOLLINGER_PERIOD
-        self.bollinger_std_dev = BOLLINGER_STD_DEV
+        self.index_name = self.cfg["index_name"]
+        self.strike_step = self.cfg["strike_step"]
+        self.target_premium_low = self.cfg["option_premium_band_low"]
+        self.target_premium_high = self.cfg["option_premium_band_high"]
+        self.bollinger_period = self.cfg["bollinger_period"]
+        self.bollinger_std_dev = self.cfg["bollinger_std_dev"]
+        self.day_start_time = self.cfg["day_start_time"]
+        self.test_mode_start_time = self.cfg["test_mode_start_time"]
+        self.test_mode_step_seconds = self.cfg["test_mode_step_seconds"]
+        self.historical_option_lookup_delay_seconds = self.cfg["historical_option_lookup_delay_seconds"]
+        self.order_cfg = self.cfg["order"]
+
+        # Real order placement (LIVE only, never test mode/BACKTEST): live_trading_enabled is a
+        # master safety switch -- absent/false keeps LIVE fully paper-trade, exactly as before
+        # this feature existed, regardless of what target_exit says. SL is ALWAYS a real exit once
+        # live trading is enabled; target_exit additionally makes ONE of Exit1-4 real too, so the
+        # position closes on whichever of the two actually hits first.
+        self.live_trading_enabled = bool(self.cfg.get("live_trading_enabled", False))
+        self.target_exit_field, self.target_exit_label = TARGET_EXIT_FIELD_MAP.get(
+            (self.cfg.get("target_exit") or "").lower(), (None, None))
+        self.exit_labels = {
+            "exit1_hit": "Exit1 (Length of Piercing)",
+            "exit2_hit": f"Exit2 ({self.cfg['exit2_percent']}%)",
+            "exit3_hit": f"Exit3 ({self.cfg['exit3_percent']}%)",
+            "exit4_hit": "Exit4 (Bollinger)",
+        }
 
         # pattern state -- BUY and SELL are tracked as two fully independent state machines so a
         # setup in one direction never blocks or gets clobbered by the other.
@@ -193,11 +231,11 @@ class VwapPiercingEngine(ILogic):
         self.test_mode = bool(getattr(args, "test_mode", False))
         self.session_date_str = args.date if self.test_mode else date.today().strftime("%Y-%m-%d")
         # simulated test-mode clock (see __now / __advance_or_sleep)
-        self.test_clock = datetime.strptime(f"{self.session_date_str} {TEST_MODE_START_TIME}",
+        self.test_clock = datetime.strptime(f"{self.session_date_str} {self.test_mode_start_time}",
                                             "%Y-%m-%d %H:%M:%S")
         if self.test_mode:
             print(self.logic_name, ": TEST MODE -- using candles for", self.session_date_str,
-                  "with the clock starting at", TEST_MODE_START_TIME)
+                  "with the clock starting at", self.test_mode_start_time)
             # test mode prices everything from the test date's history, reusing the BACKTEST
             # helpers (__select_historical_option etc.), which read these attributes.
             self.broker = self.trade_utility.get_broker_utility()
@@ -236,7 +274,7 @@ class VwapPiercingEngine(ILogic):
         self.trade_date_str = trade_date_str
         self.candle_interval_minutes = candle_interval_minutes
         self.log_fn = log_fn or (lambda msg: None)
-        self.piercing_start_time = pattern_rules.compute_piercing_start_time(DAY_START_TIME)
+        self.piercing_start_time = pattern_rules.compute_piercing_start_time(self.day_start_time)
         self.results = []
         # replay state, same as LIVE test mode's (see __init_live / __run_pass)
         self.session_date_str = trade_date_str
@@ -519,8 +557,11 @@ class VwapPiercingEngine(ILogic):
         """
         One 1-min future candle of an open trade, identical in BACKTEST and LIVE test mode: MAE/MFE
         over its High/Low, the 14:50 force-exit at its Close, then SL and Exit-1..4 hit if its
-        High/Low touches the level (recorded at the level). Returns "FORCE" or "SL" if the trade
-        closed on this candle, else None -- recording the closed trade is __close_trade's job.
+        High/Low touches the level (recorded at the level). Returns "FORCE", "SL", or the
+        configured target_exit's label if the trade closed on this candle, else None -- recording
+        the closed trade is __close_trade's job. Mirrors LIVE's real SL-or-target_exit close so a
+        replay (backtest, or LIVE test mode) previews exactly what real trading would have done --
+        no real order is ever placed here, in either mode.
         """
         trade = ds.current_trade
         ts = str(bar[DATE_TIME])
@@ -544,24 +585,35 @@ class VwapPiercingEngine(ILogic):
         if bollinger_level is not None:
             self.__mark_exit_if_hit_range(ds, trade.exit4_hit, bollinger_level, bar, ds.direction, ts)
         self.__log_exit_breaches(ds, was_hit)
-        return "SL" if trade.sl_hit.is_hit else None
+        if trade.sl_hit.is_hit:
+            return "SL"
+        if self.__configured_real_exit_hit(trade):
+            return self.target_exit_label
+        return None
 
     def __close_trade(self, ds: _DirectionState, outcome):
-        # a replayed trade closed on a 1-min candle ("SL" or "FORCE"): LIVE test mode writes it to
-        # PaperTradeData like any live trade, BACKTEST collects it for the caller.
+        # a replayed trade closed on a 1-min candle ("SL", "FORCE", or the configured target
+        # exit's label): LIVE test mode writes it to PaperTradeData like any live trade (but never
+        # places a real order, regardless of live_trading_enabled -- test mode is a preview only),
+        # BACKTEST collects it for the caller.
         self.__stamp_mae_mfe(ds)
         if self.mode == Mode.LIVE:
-            self.__finalize_and_reset_live(ds, "SL" if outcome == "SL" else "Force Exit 14:50")
+            reason = "Force Exit 14:50" if outcome == "FORCE" else outcome
+            self.__finalize_and_reset_live(ds, reason)
             return
         trade = ds.current_trade
         self.results.append(trade)
         if outcome == "SL":
             self.__log(f"[{trade.sl_hit.timestamp}] ({ds.direction}) SL hit @ {ds.sl_level} "
                       f"({self.__fmt_option_price(trade.sl_hit.option_price)}) -- trade closed, resuming scan")
-        else:
+        elif outcome == "FORCE":
             self.__log(f"[{ds.last_exit_bar_ts}] ({ds.direction}) force-exit (14:50 cutoff) @ "
                       f"{trade.exit5_eod.future_price} ({self.__fmt_option_price(trade.exit5_eod.option_price)}) "
                       f"-- trade closed, resuming scan")
+        else:
+            hit_obj = getattr(trade, self.target_exit_field)
+            self.__log(f"[{hit_obj.timestamp}] ({ds.direction}) {outcome} hit @ {hit_obj.future_price} "
+                      f"({self.__fmt_option_price(hit_obj.option_price)}) -- REAL exit, trade closed, resuming scan")
         self.__reset_direction_backtest(ds)
 
     def __bollinger_level_at(self, ds: _DirectionState, moment):
@@ -618,12 +670,16 @@ class VwapPiercingEngine(ILogic):
              f"Exit1={ds.exit1_level:.2f} Exit2={ds.exit2_level:.2f} Exit3={ds.exit3_level:.2f} "
              f"Exit4(Bollinger)={bollinger_str}")
 
-        # SL is the one real exit here. Once it fires, the position is closed for real, so log
-        # the trade now and go back to scanning for the next Piercing setup -- not capped at
-        # one trade per day.
+        # SL is always a real exit; the configured target_exit (if any) additionally closes the
+        # trade for real, whichever of the two hits first. Once either fires, the position is
+        # closed for real, so log the trade now and go back to scanning for the next Piercing
+        # setup -- not capped at one trade per day.
         if ds.current_trade.sl_hit.is_hit:
             self.__stamp_mae_mfe(ds)
             self.__finalize_and_reset_live(ds, "SL")
+        elif self.__configured_real_exit_hit(ds.current_trade):
+            self.__stamp_mae_mfe(ds)
+            self.__finalize_and_reset_live(ds, self.target_exit_label)
 
     def __mark_exit_if_hit_point(self, ds: _DirectionState, exit_hit_obj: exit_hit, level, future_ltp, option_ltp, now_str, is_stop=False):
         # LIVE checks a single LTP point against the level (tick-driven; no High/Low range).
@@ -667,14 +723,30 @@ class VwapPiercingEngine(ILogic):
         self.__finalize_and_reset_live(ds, reason)
 
     def __finalize_and_reset_live(self, ds: _DirectionState, reason="EOD"):
+        # Square off the real position first, if one was actually opened. A failed exit order is
+        # the one failure mode that must NOT reset the state machine: if we think we're flat but
+        # the real SELL never went through, we'd stop tracking a position we still hold. Keep the
+        # trade open and let the next tick's exit check retry this same close.
+        if self.live_trading_enabled and not self.test_mode and ds.option_symbol and ds.order_quantity:
+            order_placed, _ = self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity)
+            if not order_placed:
+                print(self.logic_name, f": ({ds.direction}) REAL EXIT ORDER FAILED for {ds.option_symbol} "
+                     f"({reason}) -- NOT resetting, will retry closing on the next check")
+                return
+
         self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
                                                 describe_exit_outcomes(ds.current_trade))
-        close_option_price = ds.current_trade.sl_hit.option_price if reason == "SL" \
-            else ds.current_trade.exit5_eod.option_price
+        if reason == "SL":
+            close_option_price = ds.current_trade.sl_hit.option_price
+        elif reason == self.target_exit_label:
+            close_option_price = getattr(ds.current_trade, self.target_exit_field).option_price
+        else:
+            close_option_price = ds.current_trade.exit5_eod.option_price
         print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
              ds.current_trade.trade_type, ds.current_trade.option_name)
         ds.current_trade = None
         ds.option_symbol = ""
+        ds.order_quantity = 0
         ds.piercing_candle = None
         ds.reclaim_candle = None
         ds.last_logged_candle_ts = None
@@ -685,6 +757,44 @@ class VwapPiercingEngine(ILogic):
     def __option_market_type(self):
         broker = self.trade_utility.get_broker_utility() if self.mode == Mode.LIVE else self.broker
         return getattr(broker, "OPTION_MARKET_TYPE", self.OPTION_MARKET_TYPE)
+
+    def __configured_real_exit_hit(self, trade: paper_trade_row):
+        # True if the one exit Config/strategy_config.json's target_exit names (if any) has hit --
+        # SL is checked separately by the caller and is always real regardless of this.
+        if not self.target_exit_field:
+            return False
+        return getattr(trade, self.target_exit_field).is_hit
+
+    def __order_quantity(self):
+        return int(self.order_cfg["lot_size"]) * int(self.order_cfg["lot_count"])
+
+    def __place_real_order(self, symbol, transaction_type, quantity):
+        """
+        Places a real MARKET order via the broker -- LIVE mode only, and only when
+        Config/strategy_config.json's live_trading_enabled is true (checked by callers before
+        this is ever reached). Returns (success, order_id); place_order itself already retries
+        and returns "" on failure, so no exception handling is needed here beyond a defensive
+        catch-all, since a bad symbol/permission error must never be allowed to crash the engine
+        mid-trade and leave a real position untracked.
+        """
+        broker = self.trade_utility.get_broker_utility()
+        try:
+            order_id = broker.place_order(
+                tradingsymbol=symbol,
+                transaction_type=transaction_type,
+                quantity=quantity,
+                product=self.order_cfg["product_type"],
+                order_type=self.order_cfg["order_type"],
+                market_type=self.__option_market_type(),
+            )
+        except Exception:
+            print(self.logic_name, f": REAL ORDER EXCEPTION placing {transaction_type} {quantity} x {symbol}")
+            traceback.print_exc()
+            return False, ""
+        success = bool(order_id)
+        print(self.logic_name, f": REAL ORDER {'PLACED' if success else 'FAILED'} -- "
+             f"{transaction_type} {quantity} x {symbol}", f"order_id={order_id!r}" if success else "")
+        return success, order_id
 
     def __select_option_by_premium(self, broker, option_type):
         # Fyers' real getOptionChain() returns strike/type/live-premium for every contract around
@@ -739,11 +849,11 @@ class VwapPiercingEngine(ILogic):
         # "nearest" here, not an exact real-time LTP, since no intrabar ticks exist historically.
         if not option_symbol:
             return None
-        str_from = f"{self.trade_date_str} {DAY_START_TIME}"
+        str_from = f"{self.trade_date_str} {self.day_start_time}"
         # entry selection alone fires ~40 of these back-to-back (one per candidate strike) --
         # paced to avoid tripping the broker's per-second rate limit (seen in practice: Fyers
         # returning HTTP 429 "request limit reached" without this).
-        time.sleep(HISTORICAL_OPTION_LOOKUP_DELAY_SECONDS)
+        time.sleep(self.historical_option_lookup_delay_seconds)
         data = self.broker.fetchOHLC(option_symbol, str_from, ts, interval="1minute",
                                      all_data=True, market_type=self.__option_market_type())
         if data is None or len(data) == 0:
@@ -775,7 +885,7 @@ class VwapPiercingEngine(ILogic):
         # end of an execute-loop pass: test mode (fast mode) jumps the simulated clock ahead
         # instead of waiting; normal LIVE sleeps.
         if self.test_mode:
-            self.test_clock += timedelta(seconds=TEST_MODE_STEP_SECONDS)
+            self.test_clock += timedelta(seconds=self.test_mode_step_seconds)
         else:
             time.sleep(seconds)
 
@@ -803,15 +913,15 @@ class VwapPiercingEngine(ILogic):
                 self.__load_test_day_candles(broker, interval_minutes)
 
         # Replay the day on the same simulated clock LIVE test mode runs (start at
-        # TEST_MODE_START_TIME, one TEST_MODE_STEP_SECONDS step per pass), through the same
+        # test_mode_start_time, one test_mode_step_seconds step per pass), through the same
         # __run_pass -- so candles are revealed, and entries/exits decided, at exactly the same
         # moments in both.
-        clock = datetime.strptime(f"{self.trade_date_str} {TEST_MODE_START_TIME}", "%Y-%m-%d %H:%M:%S")
+        clock = datetime.strptime(f"{self.trade_date_str} {self.test_mode_start_time}", "%Y-%m-%d %H:%M:%S")
         day_end = datetime.strptime(f"{self.trade_date_str} 15:30:00", "%Y-%m-%d %H:%M:%S") \
-            + timedelta(seconds=TEST_MODE_STEP_SECONDS)
+            + timedelta(seconds=self.test_mode_step_seconds)
         while clock <= day_end:
             self.__run_pass(clock.strftime("%Y-%m-%d %H:%M:%S"))
-            clock += timedelta(seconds=TEST_MODE_STEP_SECONDS)
+            clock += timedelta(seconds=self.test_mode_step_seconds)
 
         # end of day: any direction still IN_TRADE (SL never hit, and no 14:50 candle to force-exit
         # on) gets its exit5_eod stamped with the day's last close.
@@ -988,6 +1098,7 @@ class VwapPiercingEngine(ILogic):
 
     def __enter_trade(self, ds: _DirectionState, entry_future_price, ts, entry_row, vwap):
         option_symbol, option_price = "", 0.0
+        order_quantity = 0
         option_type = "CE" if ds.direction == "BUY" else "PE"
         # test mode picks the option from the test date's historical premiums, like BACKTEST,
         # since today's live option chain says nothing about that date.
@@ -1000,6 +1111,17 @@ class VwapPiercingEngine(ILogic):
                 ds.piercing_candle = None
                 ds.reclaim_candle = None
                 return
+
+            order_quantity = self.__order_quantity()
+            if self.live_trading_enabled:
+                order_placed, _ = self.__place_real_order(option_symbol, "BUY", order_quantity)
+                if not order_placed:
+                    print(self.logic_name, f": ({ds.direction}) Real BUY order FAILED for {option_symbol} "
+                         f"-- dropping setup, no position was opened")
+                    ds.state = STATE_SEEK_PIERCING
+                    ds.piercing_candle = None
+                    ds.reclaim_candle = None
+                    return
         else:
             # BACKTEST: real historical premiums, unlike the live path, aren't available from a
             # single batched call -- resolve the ~40 candidate strikes around ATM the same way
@@ -1036,16 +1158,17 @@ class VwapPiercingEngine(ILogic):
         if ds.direction == "BUY":
             ds.sl_level = piercing_low
             ds.exit1_level = entry_future_price + piercing_length
-            ds.exit2_level = get_target_price_by_percentage(entry_future_price, 0.2, "buy")
-            ds.exit3_level = get_target_price_by_percentage(entry_future_price, 0.75, "buy")
+            ds.exit2_level = get_target_price_by_percentage(entry_future_price, self.cfg["exit2_percent"], "buy")
+            ds.exit3_level = get_target_price_by_percentage(entry_future_price, self.cfg["exit3_percent"], "buy")
         else:
             ds.sl_level = piercing_high
             ds.exit1_level = entry_future_price - piercing_length
-            ds.exit2_level = get_target_price_by_percentage(entry_future_price, 0.2, "sell")
-            ds.exit3_level = get_target_price_by_percentage(entry_future_price, 0.75, "sell")
+            ds.exit2_level = get_target_price_by_percentage(entry_future_price, self.cfg["exit2_percent"], "sell")
+            ds.exit3_level = get_target_price_by_percentage(entry_future_price, self.cfg["exit3_percent"], "sell")
 
         ds.current_trade = trade
         ds.option_symbol = option_symbol
+        ds.order_quantity = order_quantity
         ds.mae = 0.0
         ds.mfe = 0.0
         ds.mae_time = ts
@@ -1098,14 +1221,12 @@ class VwapPiercingEngine(ILogic):
         ds.current_trade.mfe_time = ds.mfe_time
 
     def __snapshot_exit_hits(self, trade: paper_trade_row):
-        # capture before-state so we can log the exact moment each hypothesis first hits -- none
-        # of Exit-1..4 stop the trade (only SL does), so without this there's no visibility into
-        # when/whether they fired.
+        # capture before-state so we can log the exact moment each hypothesis first hits -- only
+        # SL, and whichever one (if any) Config/strategy_config.json's target_exit names, actually
+        # stop the trade; without this there's no visibility into when/whether the rest fired.
         return {
-            "Exit1 (Length of Piercing)": trade.exit1_hit.is_hit,
-            "Exit2 (0.2%)": trade.exit2_hit.is_hit,
-            "Exit3 (0.75%)": trade.exit3_hit.is_hit,
-            "Exit4 (Bollinger)": trade.exit4_hit.is_hit,
+            field: getattr(trade, field).is_hit
+            for field in ("exit1_hit", "exit2_hit", "exit3_hit", "exit4_hit")
         }
 
     def __fmt_option_price(self, price):
@@ -1113,19 +1234,22 @@ class VwapPiercingEngine(ILogic):
 
     def __log_exit_breaches(self, ds: _DirectionState, was_hit):
         trade = ds.current_trade
-        for label, hit_obj in (("Exit1 (Length of Piercing)", trade.exit1_hit),
-                               ("Exit2 (0.2%)", trade.exit2_hit),
-                               ("Exit3 (0.75%)", trade.exit3_hit),
-                               ("Exit4 (Bollinger)", trade.exit4_hit)):
-            if was_hit[label] or not hit_obj.is_hit:
+        for field in ("exit1_hit", "exit2_hit", "exit3_hit", "exit4_hit"):
+            hit_obj = getattr(trade, field)
+            if was_hit[field] or not hit_obj.is_hit:
                 continue
+            label = self.exit_labels[field]
             opt_str = self.__fmt_option_price(hit_obj.option_price)
+            # the one field target_exit names is a REAL exit once live trading is enabled -- the
+            # rest stay pure hypotheses regardless (only SL and that one ever close the trade).
+            note = "(REAL exit -- this closes the position)" if field == self.target_exit_field \
+                else "(hypothesis only -- trade continues, only SL/the configured target exit closes it)"
             if self.mode == Mode.LIVE:
                 print(self.logic_name, f": ({ds.direction}) {label} target BREACHED @ {hit_obj.future_price} ({opt_str})",
-                     "(hypothesis only -- trade continues, only SL closes it)")
+                     note)
             else:
                 self.__log(f"[{hit_obj.timestamp}] ({ds.direction}) {label} target BREACHED @ {hit_obj.future_price} ({opt_str}) "
-                          f"(hypothesis only -- trade continues, only SL closes it)")
+                          f"{note}")
 
     def __mark_exit_if_hit_range(self, ds: _DirectionState, exit_hit_obj: exit_hit, level, row, direction, ts, is_stop=False):
         # Replay (BACKTEST and LIVE test mode) checks this 1-min candle's whole High/Low range

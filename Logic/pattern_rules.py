@@ -48,6 +48,26 @@ RECLAIM_CANDLE_INTERVAL_MINUTES = 5
 ENTRY_CANDLE_INTERVAL_MINUTES = 1
 
 
+def configure(cfg):
+    """
+    Overrides this module's tunable constants from the strategy config dict (see
+    Config/config_loader.py::load_config()). Called once by VwapPiercingEngine.__init__, for both
+    LIVE and BACKTEST, so a config change can never apply to only one of them. Functions below
+    keep referencing these as plain module globals -- this just changes what those globals are.
+    """
+    global PIERCING_START_DELAY_MINUTES, PIERCING_CUTOFF_TIME, FORCE_EXIT_TIME, \
+        PIERCING_MIN_VWAP_GAP, PIERCING_MIN_OPEN_VWAP_GAP, ENTRY_MIN_VWAP_GAP, \
+        RECLAIM_CANDLE_INTERVAL_MINUTES, ENTRY_CANDLE_INTERVAL_MINUTES
+    PIERCING_START_DELAY_MINUTES = cfg["piercing_start_delay_minutes"]
+    PIERCING_CUTOFF_TIME = cfg["piercing_cutoff_time"]
+    FORCE_EXIT_TIME = cfg["force_exit_time"]
+    PIERCING_MIN_VWAP_GAP = cfg["piercing_min_vwap_gap"]
+    PIERCING_MIN_OPEN_VWAP_GAP = cfg["piercing_min_open_vwap_gap"]
+    ENTRY_MIN_VWAP_GAP = cfg["entry_min_vwap_gap"]
+    RECLAIM_CANDLE_INTERVAL_MINUTES = cfg["reclaim_candle_interval_minutes"]
+    ENTRY_CANDLE_INTERVAL_MINUTES = cfg["entry_candle_interval_minutes"]
+
+
 def compute_piercing_start_time(execution_start_time):
     """execution_start_time: 'HH:MM:SS'. Returns 'HH:MM:SS', PIERCING_START_DELAY_MINUTES after it."""
     return (datetime.strptime(execution_start_time, "%H:%M:%S")

@@ -1,0 +1,35 @@
+{
+  "day_start_time": "09:15:00",
+  "piercing_start_delay_minutes": 15,
+  "piercing_cutoff_time": "14:00:00",
+  "force_exit_time": "14:50:00",
+  "piercing_min_vwap_gap": 6,
+  "piercing_min_open_vwap_gap": 5,
+  "entry_min_vwap_gap": 5,
+  "reclaim_candle_interval_minutes": 5,
+  "entry_candle_interval_minutes": 1,
+  "bollinger_period": 20,
+  "bollinger_std_dev": 2,
+  "option_premium_band_low": 80.0,
+  "option_premium_band_high": 130.0,
+  "exit2_percent": 0.2,
+  "exit3_percent": 0.75,
+  "index_name": "NIFTY",
+  "strike_step": 50,
+  "test_mode_start_time": "09:16:15",
+  "test_mode_step_seconds": 60,
+  "historical_option_lookup_delay_seconds": 0.5,
+
+  "_comment_live_trading_enabled": "Master safety switch. Must be explicitly set to true for LIVE mode to place any real order. false (default) keeps LIVE fully paper-trade, same as before this feature existed.",
+  "live_trading_enabled": false,
+
+  "_comment_target_exit": "Which of Exit1-4 ALSO closes the real position for real, in addition to SL (SL is always a real exit regardless of this setting). One of: null, \"exit1\", \"exit2\", \"exit3\", \"exit4\". null means SL is the only real exit (current/paper-trade behavior).",
+  "target_exit": null,
+
+  "order": {
+    "order_type": "MARKET",
+    "product_type": "MIS",
+    "lot_size": 75,
+    "lot_count": 1
+  }
+}

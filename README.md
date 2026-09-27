@@ -6,8 +6,9 @@ the NIFTY future (against a running VWAP), and for each entry logs the forward p
 tracking SL plus 4 independent hypothetical exits (Length-of-Piercing, 0.2%, 0.75%, Bollinger Band) and
 MAE/MFE.
 
-**No real orders are placed.** This is a signal + logging engine only, meant to compare exit rules before
-committing to a live one.
+**Real orders are placed only if you explicitly turn that on.** By default (`live_trading_enabled: false` in
+`Config/strategy_config.json`) this is still a pure signal + logging engine, same as always. See
+**Configuration** below before ever flipping that switch.
 
 Two ways to run it:
 - **Live** (`executor.py`) — polls live/delayed quotes during market hours, logs each completed trade to the
@@ -31,12 +32,13 @@ already-open trade or in-progress setup still runs to its natural conclusion aft
 candle only counts once its Open starts at least 5 points clear of VWAP and its Close crosses to more than 6
 points past VWAP on the other side; a reclaimed setup only enters once LTP (live) / Close (backtest) clears
 back through VWAP by more than 5 points, in the piercing direction. Once pierced, reclaim is sought across as
-many subsequent candles as it takes (no abandon-after-one-miss). **SL is the one real exit** — Exit-1..4
-(Length-of-Piercing, 0.2%, 0.75%, Bollinger) are parallel hypotheses tracked purely for comparison, not real
-closes; breaching one is logged but doesn't close the trade. Once SL hits, that trade is logged and the
-engine immediately resumes scanning for the next Piercing setup in that direction — there is no
-one-trade-per-day cap. Any trade still open at **14:50** is force-closed at the prevailing price regardless
-of SL/Exit-1..4 state (logged to `Exit5 (EOD)`).
+many subsequent candles as it takes (no abandon-after-one-miss). **SL is always a real exit** — Exit-1..4
+(Length-of-Piercing, 0.2%, 0.75%, Bollinger) are parallel hypotheses tracked purely for comparison; breaching
+one is logged but doesn't close the trade, unless it's the one named by `Config.target_exit` (see
+**Configuration**), in which case it closes the trade for real too, whichever of it or SL hits first. Once
+the trade closes, it's logged and the engine immediately resumes scanning for the next Piercing setup in
+that direction — there is no one-trade-per-day cap. Any trade still open at **14:50** is force-closed at the
+prevailing price regardless of SL/Exit-1..4 state (logged to `Exit5 (EOD)`).
 
 This package is meant to live at `Executor_One/BusinessLogic/vwappiercing_options/` inside the parent
 `Executor_One` checkout — it imports from sibling packages there (`DataTypes`, `Utility`, `BrokerUtility`,
@@ -64,6 +66,11 @@ vwappiercing_options/
 │   ├── pattern_rules.py           # pure Piercing/Reclaim/Confirm/window predicates, and
 │   │                               #   resolve_front_month_future_symbol (shared)
 │   └── option_selection.py        # premium-nearest-to-band selection (shared w/ tests)
+├── Config/
+│   ├── strategy_config.json       # every tunable trading parameter (see Configuration below) --
+│   │                               #   read once at startup by both LIVE and BACKTEST
+│   └── config_loader.py           # load_config() -- JSON + hardcoded fallback defaults, so a
+│                                    #   missing/partial file never breaks or silently disables it
 ├── DataTypes/
 │   └── paper_trade_data.py        # paper_trade_row -- shared row shape for both PaperTradeData
 │                                    #   (live engine) and BackTestData (backtest engine)
@@ -118,6 +125,62 @@ the trade closed (e.g. `Exit1:+23.90, Exit3:+65.20 (Best: Exit3)`), or `SL` if n
 
 See `VWAPPiercingOptions.xlsx` for the original column layout reference (both sheets have since been
 extended beyond the simpler layout shown there).
+
+## Configuration (`Config/strategy_config.json`)
+
+Every tunable trading parameter lives in one JSON file, loaded once at startup by `Config/config_loader.py`
+and applied identically to LIVE and BACKTEST (via `pattern_rules.configure()` for the pure predicates, and
+directly as instance attributes on `VwapPiercingEngine` for everything else) — a change here can never apply
+to only one of the two engines. A missing file, or a file missing individual keys, falls back to the same
+hardcoded defaults this strategy has always used, so it's always safe to delete or partially edit.
+
+| Key | What it controls |
+|---|---|
+| `day_start_time` | Session start (`09:15:00`) used for VWAP/candle windows |
+| `piercing_start_delay_minutes` / `piercing_cutoff_time` | How long after start to wait before seeking a Piercing, and when to stop looking for new ones (also when an incomplete setup gets abandoned) |
+| `force_exit_time` | Any open trade still open at this time is force-closed regardless of exit state |
+| `piercing_min_vwap_gap` / `piercing_min_open_vwap_gap` | Noise filters on how far Open/Close must clear VWAP to count as a real Piercing |
+| `entry_min_vwap_gap` | How far price must clear back through VWAP to trigger entry |
+| `reclaim_candle_interval_minutes` / `entry_candle_interval_minutes` | Fixed candle timeframes for the Reclaim and Entry legs |
+| `bollinger_period` / `bollinger_std_dev` | Exit-4's Bollinger Band settings |
+| `option_premium_band_low` / `option_premium_band_high` | The premium band the cheapest option is picked from |
+| `exit2_percent` / `exit3_percent` | Exit-2 and Exit-3's target move, as a % of entry price |
+| `index_name` / `strike_step` | Which index, and its strike spacing |
+| `test_mode_start_time` / `test_mode_step_seconds` | LIVE test mode's simulated-clock start time and step size (see `--test_mode` below) |
+| `historical_option_lookup_delay_seconds` | Pacing between BACKTEST's per-strike historical option lookups, to stay under the broker's rate limit |
+| **`live_trading_enabled`** | **Master safety switch for real orders — see below** |
+| **`target_exit`** | **Which exit (if any) also closes the trade for real — see below** |
+| `order.order_type` / `order.product_type` / `order.lot_size` / `order.lot_count` | Real order details: e.g. `"MARKET"`, `"MIS"`, `75`, `1` |
+
+### Real order placement
+
+By default, `live_trading_enabled` is `false` and this strategy behaves exactly as it always has: a signal +
+logging engine that places no real orders, in LIVE or BACKTEST/test mode alike. Setting it to `true` makes
+the **LIVE, non-test-mode** engine place a real MARKET order for the selected option at entry, and a real
+squaring-off order when the trade closes. It is never consulted in BACKTEST or `--test_mode` — those remain
+pure previews regardless of this setting, so you can safely rehearse a config change there first.
+
+**SL is always a real exit** once `live_trading_enabled` is `true` — it's never optional. `target_exit` names
+one additional exit (`"exit1"`, `"exit2"`, `"exit3"`, `"exit4"`, or `null`) that also closes the trade for
+real, so the position closes on whichever of SL or that target hits first; `null` (default) means SL is the
+only real exit. BACKTEST and LIVE test mode both honor `target_exit` too, purely for previewing what LIVE
+would actually do — so `describe_exit_outcomes()`'s "Best Case Exit" reporting and a real run's actual close
+reason can be compared directly.
+
+If placing the real entry order fails, the setup is dropped (no paper trade is recorded, no position was
+opened). If placing the real *exit* order fails, the engine does **not** reset its state — it keeps retrying
+the close on every subsequent check, since resetting while the real position is still open would mean losing
+track of a position you're still holding.
+
+### LIVE test mode (`--test_mode true --date YYYY-MM-DD`)
+
+`executor.py --test_mode true --date YYYY-MM-DD` runs the live engine's actual code (threads, `execute()`,
+order-placement gating, all of it) against a past date's candles on a simulated clock (starting at
+`test_mode_start_time`, advancing `test_mode_step_seconds` per pass) instead of polling the broker in real
+time — so it produces the same trades a `run_backtest.py` run would for that date, but by exercising the
+exact live code path rather than a separate one. It's the fastest way to sanity-check a config change (or the
+live code itself) without waiting for market hours, and it **never** places a real order regardless of
+`live_trading_enabled`.
 
 ## Running the strategy (via executor.py)
 
