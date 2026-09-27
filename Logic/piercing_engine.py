@@ -53,9 +53,11 @@ from Utility.utility import compute_vwap, compute_bollinger_bands, get_target_pr
     generate_monthly_expiry_dates
 from DataTypes.defines import *
 from ..DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_hit
+from ..DataTypes.order_log_data import order_log_row
 from ..UserInterface.adapter.login.login import *
 from ..UserInterface.adapter.config.config import *
 from ..UserInterface.gsheet.paper_trade.paper_trade import *
+from ..UserInterface.gsheet.order_log.order_log import *
 from ..Config.config_loader import load_config
 from . import pattern_rules
 from .option_selection import select_by_premium, select_cheapest_in_band
@@ -224,6 +226,7 @@ class VwapPiercingEngine(ILogic):
         self.quotes_utility.set_trade_utility(self.trade_utility)
         self.config_data = self.obj_ui_adapter_config.get_data()
         self.obj_paper_trade_writer = UserInterfacePaperTrade(args.key)
+        self.obj_order_log_writer = UserInterfaceOrderLog(args.key)
 
         # executor.py --test_mode true --date YYYY-MM-DD: run against that trading date's candles
         # instead of today's. The clock (start/stop/piercing window) still runs on real time; only
@@ -723,12 +726,21 @@ class VwapPiercingEngine(ILogic):
         self.__finalize_and_reset_live(ds, reason)
 
     def __finalize_and_reset_live(self, ds: _DirectionState, reason="EOD"):
+        if reason == "SL":
+            close_option_price = ds.current_trade.sl_hit.option_price
+        elif reason == self.target_exit_label:
+            close_option_price = getattr(ds.current_trade, self.target_exit_field).option_price
+        else:
+            close_option_price = ds.current_trade.exit5_eod.option_price
+
         # Square off the real position first, if one was actually opened. A failed exit order is
         # the one failure mode that must NOT reset the state machine: if we think we're flat but
         # the real SELL never went through, we'd stop tracking a position we still hold. Keep the
         # trade open and let the next tick's exit check retry this same close.
         if self.live_trading_enabled and not self.test_mode and ds.option_symbol and ds.order_quantity:
-            order_placed, _ = self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity)
+            order_placed, _ = self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity,
+                                                       trade_type=ds.direction, order_type="Exit",
+                                                       reason=reason, reference_price=close_option_price)
             if not order_placed:
                 print(self.logic_name, f": ({ds.direction}) REAL EXIT ORDER FAILED for {ds.option_symbol} "
                      f"({reason}) -- NOT resetting, will retry closing on the next check")
@@ -736,12 +748,6 @@ class VwapPiercingEngine(ILogic):
 
         self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
                                                 describe_exit_outcomes(ds.current_trade))
-        if reason == "SL":
-            close_option_price = ds.current_trade.sl_hit.option_price
-        elif reason == self.target_exit_label:
-            close_option_price = getattr(ds.current_trade, self.target_exit_field).option_price
-        else:
-            close_option_price = ds.current_trade.exit5_eod.option_price
         print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
              ds.current_trade.trade_type, ds.current_trade.option_name)
         ds.current_trade = None
@@ -768,7 +774,8 @@ class VwapPiercingEngine(ILogic):
     def __order_quantity(self):
         return int(self.order_cfg["lot_size"]) * int(self.order_cfg["lot_count"])
 
-    def __place_real_order(self, symbol, transaction_type, quantity):
+    def __place_real_order(self, symbol, transaction_type, quantity, trade_type="", order_type="",
+                            reason="", reference_price=0.0):
         """
         Places a real MARKET order via the broker -- LIVE mode only, and only when
         Config/strategy_config.json's live_trading_enabled is true (checked by callers before
@@ -776,6 +783,11 @@ class VwapPiercingEngine(ILogic):
         and returns "" on failure, so no exception handling is needed here beyond a defensive
         catch-all, since a bad symbol/permission error must never be allowed to crash the engine
         mid-trade and leave a real position untracked.
+
+        Every call -- success or failure -- is logged to OrderLog as its own row (trade_type/
+        order_type/reason/reference_price are purely for that log; they don't affect placement).
+        A failed exit retries on the next tick (see __finalize_and_reset_live), so a stuck exit
+        naturally shows up as repeated FAILED rows until one succeeds.
         """
         broker = self.trade_utility.get_broker_utility()
         try:
@@ -790,10 +802,24 @@ class VwapPiercingEngine(ILogic):
         except Exception:
             print(self.logic_name, f": REAL ORDER EXCEPTION placing {transaction_type} {quantity} x {symbol}")
             traceback.print_exc()
-            return False, ""
+            order_id = ""
         success = bool(order_id)
         print(self.logic_name, f": REAL ORDER {'PLACED' if success else 'FAILED'} -- "
              f"{transaction_type} {quantity} x {symbol}", f"order_id={order_id!r}" if success else "")
+        self.obj_order_log_writer.write_order(order_log_row(
+            timestamp=datetime.now().strftime("%H:%M:%S"),
+            date=date.today().strftime("%Y-%m-%d"),
+            future=self.future_symbol,
+            option_name=symbol,
+            trade_type=trade_type,
+            order_type=order_type,
+            transaction_type=transaction_type,
+            quantity=quantity,
+            order_id=order_id,
+            status="PLACED" if success else "FAILED",
+            reason=reason,
+            reference_price=reference_price,
+        ))
         return success, order_id
 
     def __select_option_by_premium(self, broker, option_type):
@@ -1114,7 +1140,9 @@ class VwapPiercingEngine(ILogic):
 
             order_quantity = self.__order_quantity()
             if self.live_trading_enabled:
-                order_placed, _ = self.__place_real_order(option_symbol, "BUY", order_quantity)
+                order_placed, _ = self.__place_real_order(option_symbol, "BUY", order_quantity,
+                                                           trade_type=ds.direction, order_type="Entry",
+                                                           reference_price=option_price)
                 if not order_placed:
                     print(self.logic_name, f": ({ds.direction}) Real BUY order FAILED for {option_symbol} "
                          f"-- dropping setup, no position was opened")
