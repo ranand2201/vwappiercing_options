@@ -181,9 +181,9 @@ class VwapPiercingEngine(ILogic):
         self.historical_option_lookup_delay_seconds = self.cfg["historical_option_lookup_delay_seconds"]
         self.order_cfg = self.cfg["order"]
 
-        # Real order placement (LIVE only, never test mode/BACKTEST): live_trading_enabled is a
-        # master safety switch -- absent/false keeps LIVE fully paper-trade, exactly as before
-        # this feature existed, regardless of what target_exit says. SL is ALWAYS a real exit once
+        # Real order placement (LIVE, including LIVE test mode; never BACKTEST):
+        # live_trading_enabled is a master safety switch -- absent/false keeps LIVE fully
+        # paper-trade, exactly as before this feature existed, regardless of what target_exit says. SL is ALWAYS a real exit once
         # live trading is enabled; target_exit additionally makes ONE of Exit1-4 real too, so the
         # position closes on whichever of the two actually hits first.
         self.live_trading_enabled = bool(self.cfg.get("live_trading_enabled", False))
@@ -239,6 +239,9 @@ class VwapPiercingEngine(ILogic):
         if self.test_mode:
             print(self.logic_name, ": TEST MODE -- using candles for", self.session_date_str,
                   "with the clock starting at", self.test_mode_start_time)
+            if self.live_trading_enabled:
+                print(self.logic_name, ": WARNING -- live_trading_enabled is true: TEST MODE WILL PLACE "
+                      "REAL MARKET ORDERS for the replayed trades' entries and exits")
             # test mode prices everything from the test date's history, reusing the BACKTEST
             # helpers (__select_historical_option etc.), which read these attributes.
             self.broker = self.trade_utility.get_broker_utility()
@@ -453,9 +456,13 @@ class VwapPiercingEngine(ILogic):
         # have fully closed by the simulated time (a candle starting at T closes at T + interval),
         # so the engine never sees prices from later in the day.
         if not self.__is_replay():
-            return broker.fetchOHLC(self.future_symbol, str_from_date, now_str,
+            # Fyers ignores the time-of-day in the range and returns the whole day so far,
+            # INCLUDING the candle still forming -- drop it, or its cursor would move past that
+            # candle after seeing only its first few seconds and never check it once closed.
+            data = broker.fetchOHLC(self.future_symbol, str_from_date, now_str,
                                     interval=f"{interval_minutes}minute",
                                     all_data=True, market_type=self.FUTURE_MARKET_TYPE)
+            return self.__closed_by(data, interval_minutes, now_str)
         day = self.test_day_candles.get(interval_minutes)
         if day is None:
             day = self.__load_test_day_candles(broker, interval_minutes)
@@ -737,7 +744,7 @@ class VwapPiercingEngine(ILogic):
         # the one failure mode that must NOT reset the state machine: if we think we're flat but
         # the real SELL never went through, we'd stop tracking a position we still hold. Keep the
         # trade open and let the next tick's exit check retry this same close.
-        if self.live_trading_enabled and not self.test_mode and ds.option_symbol and ds.order_quantity:
+        if self.live_trading_enabled and ds.option_symbol and ds.order_quantity:
             order_placed, _ = self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity,
                                                        trade_type=ds.direction, order_type="Exit",
                                                        reason=reason, reference_price=close_option_price)
@@ -779,7 +786,8 @@ class VwapPiercingEngine(ILogic):
         """
         Places a real MARKET order via the broker -- LIVE mode only, and only when
         Config/strategy_config.json's live_trading_enabled is true (checked by callers before
-        this is ever reached). Returns (success, order_id); place_order itself already retries
+        this is ever reached). LIVE test mode places the same regular order (AMO isn't an option:
+        Fyers' API rejects AMO orders). Returns (success, order_id); place_order itself already retries
         and returns "" on failure, so no exception handling is needed here beyond a defensive
         catch-all, since a bad symbol/permission error must never be allowed to crash the engine
         mid-trade and leave a real position untracked.
@@ -817,7 +825,7 @@ class VwapPiercingEngine(ILogic):
             quantity=quantity,
             order_id=order_id,
             status="PLACED" if success else "FAILED",
-            reason=reason,
+            reason=f"{reason} (test mode)".strip() if self.test_mode else reason,
             reference_price=reference_price,
         ))
         return success, order_id
@@ -1095,14 +1103,33 @@ class VwapPiercingEngine(ILogic):
 
         # LIVE fills at the prevailing LTP -- the 1-min close is what *triggers* the entry, but by
         # the time it's acted on the tradable price is the live one, so that's what gets logged as
-        # the entry price. Replay (BACKTEST / test mode) has no intrabar ticks, so the triggering
-        # candle's own Close stands in for it.
+        # the entry price. Replay (BACKTEST / test mode) has no intrabar ticks, so the next 1-min
+        # candle's Open -- the first price after the trigger closed, i.e. what LIVE's LTP sees --
+        # stands in for it (the triggering Close if there's no next candle). Using the Close
+        # instead shifted SL/Exit-1..3 vs LIVE by however far price moved off it (seen in
+        # practice: an Exit1 LIVE hit was missed in test mode by ~1 point).
         entry_price = close_price
         if self.mode == Mode.LIVE and not self.test_mode:
             ltp = self.__ltp(self.future_symbol)
             if ltp is not None:
                 entry_price = ltp
+        else:
+            next_open = self.__next_entry_bar_open(ts)
+            if next_open is not None:
+                entry_price = next_open
         self.__enter_trade(ds, entry_price, ts, entry_row=row, vwap=vwap)
+
+    def __next_entry_bar_open(self, ts):
+        # replay only: Open of the 1-min candle right after the one starting at ts. Its Open is
+        # known the instant it starts, so this isn't look-ahead even though it hasn't closed yet.
+        day = self.test_day_candles.get(pattern_rules.ENTRY_CANDLE_INTERVAL_MINUTES)
+        if day is None or len(day) == 0:
+            return None
+        starts = day[DATE_TIME].astype(str).map(self.__session_time)
+        later = day[(starts > self.__session_time(ts)).values]
+        if len(later) == 0:
+            return None
+        return float(later.iloc[0][OPEN_PRICE])
 
     def __log_event(self, message):
         """Pattern-event logging to whichever sink this mode uses -- stdout for LIVE, log_fn for
@@ -1163,6 +1190,21 @@ class VwapPiercingEngine(ILogic):
                 self.__log(f"[{ts}] ({ds.direction}) No option found in "
                           f"{self.target_premium_low:.0f}-{self.target_premium_high:.0f} band at entry -- "
                           f"option price data unavailable for this trade")
+
+            # LIVE test mode: place a real entry order (see __place_real_order) for the
+            # historically-selected option, gated on the same live_trading_enabled switch.
+            if self.mode == Mode.LIVE and self.test_mode and self.live_trading_enabled and option_symbol:
+                order_quantity = self.__order_quantity()
+                order_placed, _ = self.__place_real_order(option_symbol, "BUY", order_quantity,
+                                                           trade_type=ds.direction, order_type="Entry",
+                                                           reference_price=option_price)
+                if not order_placed:
+                    print(self.logic_name, f": ({ds.direction}) Real BUY order FAILED for {option_symbol} "
+                         f"-- dropping setup, no position was opened")
+                    ds.state = STATE_SEEK_PIERCING
+                    ds.piercing_candle = None
+                    ds.reclaim_candle = None
+                    return
 
         trade = paper_trade_row()
         trade.date = self.session_date_str if self.mode == Mode.LIVE else self.trade_date_str

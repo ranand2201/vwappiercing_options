@@ -157,8 +157,9 @@ hardcoded defaults this strategy has always used, so it's always safe to delete 
 By default, `live_trading_enabled` is `false` and this strategy behaves exactly as it always has: a signal +
 logging engine that places no real orders, in LIVE or BACKTEST/test mode alike. Setting it to `true` makes
 the **LIVE, non-test-mode** engine place a real MARKET order for the selected option at entry, and a real
-squaring-off order when the trade closes. It is never consulted in BACKTEST or `--test_mode` — those remain
-pure previews regardless of this setting, so you can safely rehearse a config change there first.
+squaring-off order when the trade closes. `--test_mode` places the same **real** regular entry/exit orders
+(Fyers' API doesn't support AMO orders). It is never consulted in BACKTEST, which remains a pure preview regardless of
+this setting.
 
 **SL is always a real exit** once `live_trading_enabled` is `true` — it's never optional. `target_exit` names
 one additional exit (`"exit1"`, `"exit2"`, `"exit3"`, `"exit4"`, or `null`) that also closes the trade for
@@ -179,8 +180,9 @@ order-placement gating, all of it) against a past date's candles on a simulated 
 `test_mode_start_time`, advancing `test_mode_step_seconds` per pass) instead of polling the broker in real
 time — so it produces the same trades a `run_backtest.py` run would for that date, but by exercising the
 exact live code path rather than a separate one. It's the fastest way to sanity-check a config change (or the
-live code itself) without waiting for market hours, and it **never** places a real order regardless of
-`live_trading_enabled`.
+live code itself) without waiting for market hours. **When `live_trading_enabled` is `true`, it places real
+MARKET entry/exit orders** for the historically-selected option, so during market hours a past date's replay
+trades for real (outside market hours the broker rejects them); otherwise it places no orders.
 
 ## Running the strategy (via executor.py)
 

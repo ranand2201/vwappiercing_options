@@ -21,15 +21,15 @@
   "historical_option_lookup_delay_seconds": 0.5,
 
   "_comment_live_trading_enabled": "Master safety switch. Must be explicitly set to true for LIVE mode to place any real order. false (default) keeps LIVE fully paper-trade, same as before this feature existed.",
-  "live_trading_enabled": false,
+  "live_trading_enabled": true,
 
   "_comment_target_exit": "Which of Exit1-4 ALSO closes the real position for real, in addition to SL (SL is always a real exit regardless of this setting). One of: null, \"exit1\", \"exit2\", \"exit3\", \"exit4\". null means SL is the only real exit (current/paper-trade behavior).",
-  "target_exit": null,
+  "target_exit": "exit1",
 
   "order": {
     "order_type": "MARKET",
     "product_type": "MIS",
-    "lot_size": 75,
+    "lot_size": 65,
     "lot_count": 1
   }
 }
