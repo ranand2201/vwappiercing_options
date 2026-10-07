@@ -50,7 +50,7 @@ DEFAULTS = {
     "order": {
         "order_type": "MARKET",
         "product_type": "MIS",
-        "lot_size": 75,
+        "lot_size": 65,  # NSE-fixed NIFTY lot size
         "lot_count": 1,
     },
 }
