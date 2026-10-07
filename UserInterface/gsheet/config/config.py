@@ -18,6 +18,18 @@ TEST_MODE_START_TIME = 1
 TEST_MODE_END_TIME = 2
 
 
+def to_24h_time(str_time):
+    # The sheet shows times as "3:15:00 PM". Just stripping " PM" turned that into 03:15:00, so the
+    # engine saw its end time as already passed and stopped right after startup.
+    str_time = str_time.strip()
+    for fmt in ("%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(str_time, fmt).strftime("%H:%M:%S")
+        except ValueError:
+            pass
+    raise ValueError(f"Config sheet: unrecognised time '{str_time}'")
+
+
 class UserInterfaceConfig(IUserInterface):
 
     def __init__(self, key):
@@ -39,10 +51,8 @@ class UserInterfaceConfig(IUserInterface):
         self.data.test_mode_status = True if subset[0][2] == "TRUE" else False
         self.data.start_time = (datetime.now() + timedelta(seconds=60)).strftime("%H:%M:%S") if self.data.test_mode_status else subset[1][0]
         self.data.end_time = (datetime.now() + timedelta(seconds=2500)).strftime("%H:%M:%S") if self.data.test_mode_status else subset[2][0]
-        self.data.start_time = self.data.start_time.replace(" AM", "")
-        self.data.end_time = self.data.end_time.replace(" AM", "")
-        self.data.start_time = self.data.start_time.replace(" PM", "")
-        self.data.end_time = self.data.end_time.replace(" PM", "")
+        self.data.start_time = to_24h_time(self.data.start_time)
+        self.data.end_time = to_24h_time(self.data.end_time)
         # NOTE: example_logic's UserInterfaceConfig reads this as subset[0][1] (col C, the
         # "Test Mode" label) which is a pre-existing off-by-one bug there. This sheet's layout
         # puts the actual Candle Interval value in col B (subset[0][0]).
