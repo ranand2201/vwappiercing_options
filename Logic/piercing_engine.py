@@ -126,6 +126,10 @@ class _DirectionState:
         # LIVE real trading only: the quantity a real BUY order for this position was placed for,
         # so the exit's real SELL order squares off exactly what was actually bought.
         self.order_quantity = 0
+        # LIVE real trading only: True only if the entry BUY actually went through. A failed BUY
+        # still lets the trade proceed (paper-tracked, logged to OrderLog with an empty order_id),
+        # but its exit must then only be logged, never sent -- a real SELL would open a short.
+        self.real_position_open = False
         self.sl_level = 0.0
         self.exit1_level = 0.0
         self.exit2_level = 0.0
@@ -747,8 +751,9 @@ class VwapPiercingEngine(ILogic):
         if self.live_trading_enabled and ds.option_symbol and ds.order_quantity:
             order_placed, _ = self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity,
                                                        trade_type=ds.direction, order_type="Exit",
-                                                       reason=reason, reference_price=close_option_price)
-            if not order_placed:
+                                                       reason=reason, reference_price=close_option_price,
+                                                       place=ds.real_position_open)
+            if ds.real_position_open and not order_placed:
                 print(self.logic_name, f": ({ds.direction}) REAL EXIT ORDER FAILED for {ds.option_symbol} "
                      f"({reason}) -- NOT resetting, will retry closing on the next check")
                 return
@@ -760,6 +765,7 @@ class VwapPiercingEngine(ILogic):
         ds.current_trade = None
         ds.option_symbol = ""
         ds.order_quantity = 0
+        ds.real_position_open = False
         ds.piercing_candle = None
         ds.reclaim_candle = None
         ds.last_logged_candle_ts = None
@@ -782,7 +788,7 @@ class VwapPiercingEngine(ILogic):
         return int(self.order_cfg["lot_size"]) * int(self.order_cfg["lot_count"])
 
     def __place_real_order(self, symbol, transaction_type, quantity, trade_type="", order_type="",
-                            reason="", reference_price=0.0):
+                            reason="", reference_price=0.0, place=True):
         """
         Places a real MARKET order via the broker -- LIVE mode only, and only when
         Config/strategy_config.json's live_trading_enabled is true (checked by callers before
@@ -796,23 +802,29 @@ class VwapPiercingEngine(ILogic):
         order_type/reason/reference_price are purely for that log; they don't affect placement).
         A failed exit retries on the next tick (see __finalize_and_reset_live), so a stuck exit
         naturally shows up as repeated FAILED rows until one succeeds.
+
+        place=False skips the broker entirely and only logs the row (status NOT PLACED, empty
+        order_id) -- used for the exit of a trade whose entry BUY failed, so there's nothing to sell.
         """
-        broker = self.trade_utility.get_broker_utility()
-        try:
-            order_id = broker.place_order(
-                tradingsymbol=symbol,
-                transaction_type=transaction_type,
-                quantity=quantity,
-                product=self.order_cfg["product_type"],
-                order_type=self.order_cfg["order_type"],
-                market_type=self.__option_market_type(),
-            )
-        except Exception:
-            print(self.logic_name, f": REAL ORDER EXCEPTION placing {transaction_type} {quantity} x {symbol}")
-            traceback.print_exc()
-            order_id = ""
+        order_id = ""
+        if place:
+            broker = self.trade_utility.get_broker_utility()
+            try:
+                order_id = broker.place_order(
+                    tradingsymbol=symbol,
+                    transaction_type=transaction_type,
+                    quantity=quantity,
+                    product=self.order_cfg["product_type"],
+                    order_type=self.order_cfg["order_type"],
+                    market_type=self.__option_market_type(),
+                )
+            except Exception:
+                print(self.logic_name, f": REAL ORDER EXCEPTION placing {transaction_type} {quantity} x {symbol}")
+                traceback.print_exc()
+                order_id = ""
         success = bool(order_id)
-        print(self.logic_name, f": REAL ORDER {'PLACED' if success else 'FAILED'} -- "
+        status = "PLACED" if success else ("FAILED" if place else "NOT PLACED")
+        print(self.logic_name, f": REAL ORDER {status} -- "
              f"{transaction_type} {quantity} x {symbol}", f"order_id={order_id!r}" if success else "")
         self.obj_order_log_writer.write_order(order_log_row(
             timestamp=datetime.now().strftime("%H:%M:%S"),
@@ -824,7 +836,7 @@ class VwapPiercingEngine(ILogic):
             transaction_type=transaction_type,
             quantity=quantity,
             order_id=order_id,
-            status="PLACED" if success else "FAILED",
+            status=status,
             reason=f"{reason} (test mode)".strip() if self.test_mode else reason,
             reference_price=reference_price,
         ))
@@ -1152,6 +1164,7 @@ class VwapPiercingEngine(ILogic):
     def __enter_trade(self, ds: _DirectionState, entry_future_price, ts, entry_row, vwap):
         option_symbol, option_price = "", 0.0
         order_quantity = 0
+        order_placed = False
         option_type = "CE" if ds.direction == "BUY" else "PE"
         # test mode picks the option from the test date's historical premiums, like BACKTEST,
         # since today's live option chain says nothing about that date.
@@ -1172,11 +1185,7 @@ class VwapPiercingEngine(ILogic):
                                                            reference_price=option_price)
                 if not order_placed:
                     print(self.logic_name, f": ({ds.direction}) Real BUY order FAILED for {option_symbol} "
-                         f"-- dropping setup, no position was opened")
-                    ds.state = STATE_SEEK_PIERCING
-                    ds.piercing_candle = None
-                    ds.reclaim_candle = None
-                    return
+                         f"-- continuing as paper trade, exit will be logged but not placed")
         else:
             # BACKTEST: real historical premiums, unlike the live path, aren't available from a
             # single batched call -- resolve the ~40 candidate strikes around ATM the same way
@@ -1200,11 +1209,7 @@ class VwapPiercingEngine(ILogic):
                                                            reference_price=option_price)
                 if not order_placed:
                     print(self.logic_name, f": ({ds.direction}) Real BUY order FAILED for {option_symbol} "
-                         f"-- dropping setup, no position was opened")
-                    ds.state = STATE_SEEK_PIERCING
-                    ds.piercing_candle = None
-                    ds.reclaim_candle = None
-                    return
+                         f"-- continuing as paper trade, exit will be logged but not placed")
 
         trade = paper_trade_row()
         trade.date = self.session_date_str if self.mode == Mode.LIVE else self.trade_date_str
@@ -1239,6 +1244,7 @@ class VwapPiercingEngine(ILogic):
         ds.current_trade = trade
         ds.option_symbol = option_symbol
         ds.order_quantity = order_quantity
+        ds.real_position_open = order_placed
         ds.mae = 0.0
         ds.mfe = 0.0
         ds.mae_time = ts
