@@ -769,7 +769,7 @@ class VwapPiercingEngine(ILogic):
         ds.piercing_candle = None
         ds.reclaim_candle = None
         ds.last_logged_candle_ts = None
-        # if the piercing window is already closed (past 14:30 or before start+15min at EOD),
+        # if the piercing window is already closed (past 14:30 or before start+20min at EOD),
         # this just idles in SEEK_PIERCING harmlessly -- __check_seek_piercing gates on the window.
         ds.state = STATE_SEEK_PIERCING
 

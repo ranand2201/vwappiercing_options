@@ -13,11 +13,11 @@ from datetime import datetime, timedelta
 from DataTypes.defines import *
 from Utility.utility import generate_monthly_expiry_dates
 
-# New Piercing candidates are only looked for once VWAP has had time to settle (15 min after
+# New Piercing candidates are only looked for once VWAP has had time to settle (20 min after
 # execution start) and stop being looked for at PIERCING_CUTOFF_TIME. A setup already in progress
 # (pierced but not yet entered) at that point is abandoned too -- see is_setup_abandon_time_reached
 # -- only an already-open trade (IN_TRADE) runs past this point, until FORCE_EXIT_TIME.
-PIERCING_START_DELAY_MINUTES = 15
+PIERCING_START_DELAY_MINUTES = 20
 PIERCING_CUTOFF_TIME = "14:00:00"
 
 # Any trade still open (SL not yet hit) at this time is force-closed at the prevailing price,

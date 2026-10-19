@@ -8,7 +8,7 @@ against a past trading day's real candles. Thin wrapper around
 Logic/backtest_engine.py's run_backtest_for_day (same replay logic
 run_backtest.py uses to write BackTestData) with verbose per-event logging
 turned on, so this reflects real behavior -- including the piercing-window
-gating (start+15min to 14:30) and SL-triggers-next-trade behavior -- rather
+gating (start+20min to 14:30) and SL-triggers-next-trade behavior -- rather
 than a separate copy of the state machine that could drift.
 
 Since this only has candle-close data (no intrabar LTP ticks), entry/exit

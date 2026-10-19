@@ -1,6 +1,6 @@
 {
   "day_start_time": "09:15:00",
-  "piercing_start_delay_minutes": 15,
+  "piercing_start_delay_minutes": 20,
   "piercing_cutoff_time": "14:00:00",
   "force_exit_time": "14:50:00",
   "piercing_min_vwap_gap": 6,
