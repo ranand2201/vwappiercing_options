@@ -43,6 +43,7 @@ import time
 import traceback
 from datetime import datetime, date, timedelta
 from enum import Enum
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -100,6 +101,7 @@ STATUS_OK = "ok"
 # test_fyers_option_chain.py against the live API: "NSE:NIFTY50-INDEX"). getOptionChain()
 # prepends the exchange itself, so only the bare symbol goes here.
 CHAIN_UNDERLYING_SYMBOL = {"NIFTY": "NIFTY50-INDEX", "BANKNIFTY": "NIFTYBANK-INDEX"}
+IST = ZoneInfo("Asia/Kolkata")
 
 
 class _DirectionState:
@@ -236,7 +238,7 @@ class VwapPiercingEngine(ILogic):
         # instead of today's. The clock (start/stop/piercing window) still runs on real time; only
         # the date part changes.
         self.test_mode = bool(getattr(args, "test_mode", False))
-        self.session_date_str = args.date if self.test_mode else date.today().strftime("%Y-%m-%d")
+        self.session_date_str = args.date if self.test_mode else datetime.now(IST).date().strftime("%Y-%m-%d")
         # simulated test-mode clock (see __now / __advance_or_sleep)
         self.test_clock = datetime.strptime(f"{self.session_date_str} {self.test_mode_start_time}",
                                             "%Y-%m-%d %H:%M:%S")
@@ -826,9 +828,10 @@ class VwapPiercingEngine(ILogic):
         status = "PLACED" if success else ("FAILED" if place else "NOT PLACED")
         print(self.logic_name, f": REAL ORDER {status} -- "
              f"{transaction_type} {quantity} x {symbol}", f"order_id={order_id!r}" if success else "")
+        now = datetime.now(IST)
         self.obj_order_log_writer.write_order(order_log_row(
-            timestamp=datetime.now().strftime("%H:%M:%S"),
-            date=date.today().strftime("%Y-%m-%d"),
+            timestamp=now.strftime("%H:%M:%S"),
+            date=now.strftime("%Y-%m-%d"),
             future=self.future_symbol,
             option_name=symbol,
             trade_type=trade_type,
@@ -925,7 +928,7 @@ class VwapPiercingEngine(ILogic):
     def __now(self):
         # LIVE clock: real time, or in test mode the simulated clock, which only moves when the
         # execute loop advances it (fast mode).
-        return self.test_clock if self.test_mode else datetime.now()
+        return self.test_clock if self.test_mode else datetime.now(IST).replace(tzinfo=None)
 
     def __advance_or_sleep(self, seconds):
         # end of an execute-loop pass: test mode (fast mode) jumps the simulated clock ahead

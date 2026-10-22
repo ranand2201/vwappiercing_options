@@ -4,6 +4,7 @@ config.py
 """
 import sys
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 sys.path.append('../interfaces')   # path to directory containing helper.py
 
 from BusinessLogic.interfaces.Iuser_Interface import *
@@ -16,6 +17,7 @@ LOGIC_START_TIME = 2
 TEST_MODE_STATUS = 0
 TEST_MODE_START_TIME = 1
 TEST_MODE_END_TIME = 2
+IST = ZoneInfo("Asia/Kolkata")
 
 
 def to_24h_time(str_time):
@@ -49,8 +51,8 @@ class UserInterfaceConfig(IUserInterface):
         subset = [row[1:4] for row in data[1:5]]
         print("subset", subset)
         self.data.test_mode_status = True if subset[0][2] == "TRUE" else False
-        self.data.start_time = (datetime.now() + timedelta(seconds=60)).strftime("%H:%M:%S") if self.data.test_mode_status else subset[1][0]
-        self.data.end_time = (datetime.now() + timedelta(seconds=2500)).strftime("%H:%M:%S") if self.data.test_mode_status else subset[2][0]
+        self.data.start_time = (datetime.now(IST) + timedelta(seconds=60)).strftime("%H:%M:%S") if self.data.test_mode_status else subset[1][0]
+        self.data.end_time = (datetime.now(IST) + timedelta(seconds=2500)).strftime("%H:%M:%S") if self.data.test_mode_status else subset[2][0]
         self.data.start_time = to_24h_time(self.data.start_time)
         self.data.end_time = to_24h_time(self.data.end_time)
         # NOTE: example_logic's UserInterfaceConfig reads this as subset[0][1] (col C, the

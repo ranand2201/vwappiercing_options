@@ -9,16 +9,19 @@ on a day the market is closed. Writes one fake row to the PaperTradeData
 worksheet of the "VWAPPiercingOptions" Google Sheet.
 """
 import argparse
-from datetime import date, datetime
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from BusinessLogic.vwappiercing_options.UserInterface.gsheet.paper_trade.paper_trade import UserInterfacePaperTrade
 from BusinessLogic.vwappiercing_options.DataTypes.paper_trade_data import paper_trade_row, candle_snapshot, exit_hit, eod_exit
 from BusinessLogic.vwappiercing_options.Logic.backtest_engine import describe_exit_outcomes
 
+IST = ZoneInfo("Asia/Kolkata")
+
 
 def build_sample_row():
     row = paper_trade_row()
-    row.date = date.today().strftime("%Y-%m-%d")
+    row.date = datetime.now(IST).strftime("%Y-%m-%d")
     row.future = "NIFTY31JUL25F"
     row.option_name = "NIFTY31JUL2524600CE"
     row.trade_type = "BUY"
