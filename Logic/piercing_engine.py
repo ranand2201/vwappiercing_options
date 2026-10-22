@@ -342,7 +342,7 @@ class VwapPiercingEngine(ILogic):
                 piercing_window_announced = True
 
             self.__run_pass(self.__now().strftime("%Y-%m-%d %H:%M:%S"))
-            self.__advance_or_sleep(3)
+            self.__advance_or_sleep(12)
 
         for ds in self.directions.values():
             if ds.state == STATE_IN_TRADE:
