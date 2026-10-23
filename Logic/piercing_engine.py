@@ -330,7 +330,7 @@ class VwapPiercingEngine(ILogic):
         print(self.logic_name, ": Execution Started", self.execution_start_time)
         has_started = False
         piercing_window_announced = False
-
+        print(self.logic_name, ": Current time: ", datetime.now(IST).time())  
         while not self.__is_time_reached(self.execution_stop_time):
             if not self.__is_time_reached(self.execution_start_time):
                 self.__advance_or_sleep(2)
@@ -923,7 +923,8 @@ class VwapPiercingEngine(ILogic):
 
     def __is_time_reached(self, str_time):
         target_time = datetime.strptime(str_time, "%H:%M:%S").time()
-        return self.__now().time() >= target_time
+        current_time = self.test_clock.time() if self.test_mode else datetime.now(IST).time()
+        return current_time >= target_time
 
     def __now(self):
         # LIVE clock: real time, or in test mode the simulated clock, which only moves when the
