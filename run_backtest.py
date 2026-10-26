@@ -69,6 +69,8 @@ if __name__ == "__main__":
     parser.add_argument("--interval", type=int, default=None,
                         help="Candle interval in minutes (default: read from Config.candle_interval)")
     parser.add_argument("--index", type=str, default="NIFTY", help="Index name (default: NIFTY)")
+    parser.add_argument("--manual-kite-login", action="store_true",
+                        help="Use a pasted Kite redirect URL instead of automated browser login")
     args = parser.parse_args()
 
     if bool(args.start_date) != bool(args.end_date):
@@ -77,7 +79,7 @@ if __name__ == "__main__":
         parser.error("use either --days or --start-date/--end-date, not both")
 
     login = UserInterfaceLogin(args.key).get_data()
-    obj_utility_manager: utility_manager = utility_manager()
+    obj_utility_manager: utility_manager = utility_manager(manual_kite_login=args.manual_kite_login)
     broker = obj_utility_manager.get_utility_object(login).get_broker_utility()
     
     candle_interval = args.interval
