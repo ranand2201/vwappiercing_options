@@ -513,6 +513,10 @@ class VwapPiercingEngine(ILogic):
                                 f"{self.session_date_str} 15:30:00",
                                 interval=f"{interval_minutes}minute",
                                 all_data=True, market_type=self.FUTURE_MARKET_TYPE)
+        if data is not None and len(data) > 0 and DATE_TIME in data.columns:
+            timestamps = pd.to_datetime(data[DATE_TIME])
+            if timestamps.dt.tz is not None:
+                data[DATE_TIME] = timestamps.dt.tz_localize(None)
         if interval_minutes == self.candle_interval_minutes and data is not None and len(data) > 0:
             self.__add_session_vwap(data)
         self.test_day_candles[interval_minutes] = data

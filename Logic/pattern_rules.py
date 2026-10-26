@@ -95,8 +95,9 @@ def is_setup_abandon_time_reached(check_time):
 
 
 def time_of_day(date_time_str):
-    """Extracts 'HH:MM:SS' from a full 'DD-MM-YYYY HH:MM:SS' (or similar) timestamp string."""
-    return date_time_str.split(" ")[-1]
+    """Extract local 'HH:MM:SS' from broker timestamps, including timezone suffixes."""
+    time_part = date_time_str.split(" ")[-1].replace("Z", "+00:00")
+    return datetime.fromisoformat(f"2000-01-01 {time_part}").strftime("%H:%M:%S")
 
 
 def piercing_direction(row):
