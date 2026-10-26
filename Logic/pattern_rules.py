@@ -7,7 +7,6 @@ LogicVwapPiercingOptions state machine and offline testing/dry-run scripts,
 so a dry run against historical candles reflects exactly what the live
 engine would decide.
 """
-import calendar
 from datetime import datetime, timedelta
 
 from DataTypes.defines import *
@@ -163,12 +162,6 @@ def has_closed_at_or_after(candle_ts, interval_minutes, reference_ts, reference_
         candle_close_time(reference_ts, reference_interval_minutes)
 
 
-def _is_in_last_week_of_month(trade_date):
-    """True if trade_date falls within the last 7 calendar days of its month."""
-    last_day = calendar.monthrange(trade_date.year, trade_date.month)[1]
-    return trade_date.day > last_day - 7
-
-
 def resolve_front_month_future_symbol(broker, index_name, trade_date_str):
     """
     The monthly future contract that was front-month on trade_date_str (no network call).
@@ -179,20 +172,13 @@ def resolve_front_month_future_symbol(broker, index_name, trade_date_str):
     doesn't itself account for trade_date possibly falling after that month's own expiry -- so
     the first entry isn't always >= trade_date. Pick the first one that actually is.
 
-    During the last calendar week of the month, rolls to next month's contract early instead of
-    the current month's -- liquidity in the current month's contract thins out sharply in its
-    final week as the market rolls over, so testing/trading against it that late isn't
-    representative of what would actually be tradable. Used identically by the live engine
-    (against today's date) and the backtest engine (against each historical trade date).
+    Keep using the current month's contract through its expiry date. The first expiry date on or
+    after trade_date_str determines the contract; the next month's contract is selected only
+    after the current month's expiry has passed. Used by both live and backtest engines.
     """
     trade_date = datetime.strptime(trade_date_str, "%Y-%m-%d")
-
-    lookup_date = trade_date
-    if _is_in_last_week_of_month(trade_date):
-        lookup_date = (trade_date.replace(day=28) + timedelta(days=4)).replace(day=1)
-
-    for expiry_str in generate_monthly_expiry_dates(lookup_date, 1):
-        if datetime.strptime(expiry_str, "%d-%b-%Y") >= lookup_date:
+    for expiry_str in generate_monthly_expiry_dates(trade_date, 1):
+        if datetime.strptime(expiry_str, "%d-%b-%Y") >= trade_date:
             return broker.get_future_name(index_name, expiry_str), expiry_str
     # shouldn't happen within the same calendar year, but fall back to the last one generated
     last_expiry = generate_monthly_expiry_dates(lookup_date, 1)[-1]
