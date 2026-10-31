@@ -132,6 +132,7 @@ class _DirectionState:
         # still lets the trade proceed (paper-tracked, logged to OrderLog with an empty order_id),
         # but its exit must then only be logged, never sent -- a real SELL would open a short.
         self.real_position_open = False
+        self.real_exit_order_complete = False
         self.sl_level = 0.0
         self.exit1_level = 0.0
         self.exit2_level = 0.0
@@ -754,7 +755,8 @@ class VwapPiercingEngine(ILogic):
         # the one failure mode that must NOT reset the state machine: if we think we're flat but
         # the real SELL never went through, we'd stop tracking a position we still hold. Keep the
         # trade open and let the next tick's exit check retry this same close.
-        if self.live_trading_enabled and ds.option_symbol and ds.order_quantity:
+        if self.live_trading_enabled and ds.option_symbol and ds.order_quantity \
+            and not ds.real_exit_order_complete:
             order_placed, _ = self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity,
                                                        trade_type=ds.direction, order_type="Exit",
                                                        reason=reason, reference_price=close_option_price,
@@ -763,15 +765,21 @@ class VwapPiercingEngine(ILogic):
                 print(self.logic_name, f": ({ds.direction}) REAL EXIT ORDER FAILED for {ds.option_symbol} "
                      f"({reason}) -- NOT resetting, will retry closing on the next check")
                 return
+            ds.real_exit_order_complete = True
 
-        self.obj_paper_trade_writer.write_trade(ds.current_trade, self.candle_interval_minutes,
-                                                describe_exit_outcomes(ds.current_trade))
+        written = self.obj_paper_trade_writer.write_trade(
+            ds.current_trade, self.candle_interval_minutes, describe_exit_outcomes(ds.current_trade))
+        if not written:
+            print(self.logic_name, f": ({ds.direction}) Trade close was not written to PaperTradeData; "
+                  "keeping it pending for retry")
+            return
         print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
              ds.current_trade.trade_type, ds.current_trade.option_name)
         ds.current_trade = None
         ds.option_symbol = ""
         ds.order_quantity = 0
         ds.real_position_open = False
+        ds.real_exit_order_complete = False
         ds.piercing_candle = None
         ds.reclaim_candle = None
         ds.last_logged_candle_ts = None
@@ -1253,6 +1261,7 @@ class VwapPiercingEngine(ILogic):
         ds.option_symbol = option_symbol
         ds.order_quantity = order_quantity
         ds.real_position_open = order_placed
+        ds.real_exit_order_complete = False
         ds.mae = 0.0
         ds.mfe = 0.0
         ds.mae_time = ts
