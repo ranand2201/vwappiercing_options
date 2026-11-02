@@ -207,6 +207,7 @@ class VwapPiercingEngine(ILogic):
         # setup in one direction never blocks or gets clobbered by the other.
         self.future_symbol = ""
         self.current_expiry = ""
+        self.option_chain_prices = {}
         self.directions = {"BUY": _DirectionState("BUY"), "SELL": _DirectionState("SELL")}
         self.last_candle_data = None  # main-interval candle series (with VWAP column)
         self.test_mode = False  # LIVE may switch this on from args (see __init_live)
@@ -314,10 +315,15 @@ class VwapPiercingEngine(ILogic):
         self.future_symbol, self.current_expiry = pattern_rules.resolve_front_month_future_symbol(
             broker, self.index_name, self.session_date_str)
         print(self.logic_name, ": Future symbol resolved: ", self.future_symbol)
-        # Zebu's fetchOHLC/get_quotes treat market_type="" as "parse this as an option symbol"
-        # (see zebumynt_utitlity.fetchOHLC / __get_option_name); a future needs any non-empty,
-        # non-"EQ" value so the symbol is used as-is and resolved to NFO.
-        self.quotes_utility.add_stocks([self.future_symbol], [self.FUTURE_MARKET_TYPE])
+        option_symbols, option_market_type, option_counts = self.__get_startup_option_symbols(broker)
+        # Subscribe the future and both option wings together. Chain LTPs are provided as
+        # initial quote values so strategies can use premiums immediately, before the first tick.
+        symbols = [self.future_symbol] + option_symbols
+        market_types = [self.FUTURE_MARKET_TYPE] + [option_market_type] * len(option_symbols)
+        initial_prices = {symbol: price for symbol, price in self.option_chain_prices.items()}
+        self.quotes_utility.add_stocks(symbols, market_types, p_initial_prices=initial_prices)
+        print(self.logic_name, f": Subscribed future plus {len(option_symbols)} option contracts "
+              f"(CE={option_counts['CE']}, PE={option_counts['PE']})")
         if self.test_mode:
             for interval_minutes in sorted({self.candle_interval_minutes,
                                             pattern_rules.RECLAIM_CANDLE_INTERVAL_MINUTES,
@@ -325,6 +331,62 @@ class VwapPiercingEngine(ILogic):
                 self.__load_test_day_candles(broker, interval_minutes)
         self.pre_requisite_complete_event.set()
         print(self.logic_name, ": Exiting pre-requisite thread")
+
+    def __get_startup_option_symbols(self, broker, contracts_per_side=40):
+        """Select up to 40 nearest-to-ATM contracts per side using chain LTPs."""
+        underlying = CHAIN_UNDERLYING_SYMBOL.get(self.index_name, self.index_name)
+        get_option_chain = getattr(broker, "getOptionChain", None)
+        if not callable(get_option_chain):
+            print(self.logic_name, ": Broker has no getOptionChain API; subscribing to the future only")
+            return [], self.__option_market_type(), {"CE": 0, "PE": 0}
+        try:
+            chain_df, _, _ = get_option_chain(underlying)
+        except Exception:
+            print(self.logic_name, ": Option-chain lookup failed; subscribing to the future only")
+            traceback.print_exc()
+            return [], self.__option_market_type(), {"CE": 0, "PE": 0}
+        required_columns = {"symbol", "option_type", "ltp", "strike_price"}
+        if chain_df is None or chain_df.empty or not required_columns.issubset(chain_df.columns):
+            print(self.logic_name, ": Option chain unavailable or missing required columns; "
+                  "subscribing to the future only")
+            return [], self.__option_market_type(), {"CE": 0, "PE": 0}
+
+        underlying_rows = chain_df.loc[chain_df["option_type"].fillna("") == ""]
+        if underlying_rows.empty:
+            spot_prices = pd.to_numeric(chain_df["strike_price"], errors="coerce").dropna()
+            if spot_prices.empty:
+                print(self.logic_name, ": Option chain has no usable underlying price; "
+                      "subscribing to the future only")
+                return [], self.__option_market_type(), {"CE": 0, "PE": 0}
+            spot_price = spot_prices.median()
+        else:
+            spot_prices = pd.to_numeric(underlying_rows["ltp"], errors="coerce").dropna()
+            if spot_prices.empty:
+                print(self.logic_name, ": Option chain has no usable underlying price; "
+                      "subscribing to the future only")
+                return [], self.__option_market_type(), {"CE": 0, "PE": 0}
+            spot_price = spot_prices.iloc[0]
+
+        option_market_type = self.__option_market_type()
+        selected_symbols = []
+        option_counts = {"CE": 0, "PE": 0}
+        for option_type in ("CE", "PE"):
+            candidates = chain_df.loc[chain_df["option_type"] == option_type].copy()
+            candidates["ltp"] = pd.to_numeric(candidates["ltp"], errors="coerce")
+            candidates["strike_price"] = pd.to_numeric(candidates["strike_price"], errors="coerce")
+            candidates = candidates.dropna(subset=["symbol", "ltp", "strike_price"])
+            candidates = candidates.loc[(candidates["ltp"] > 0) & (candidates["symbol"].astype(str) != "")]
+            candidates["_atm_distance"] = (candidates["strike_price"] - float(spot_price)).abs()
+            candidates = candidates.sort_values(["_atm_distance", "strike_price"], kind="mergesort")
+            for _, contract in candidates.head(contracts_per_side).iterrows():
+                chain_symbol = str(contract["symbol"]).split(":")[-1]
+                selected_symbols.append(chain_symbol)
+                self.option_chain_prices[chain_symbol] = float(contract["ltp"])
+                option_counts[option_type] += 1
+
+        print(self.logic_name, f": Option chain premiums loaded for "
+              f"{sum(1 for symbol in selected_symbols if symbol in self.option_chain_prices)} contracts")
+        return selected_symbols, option_market_type, option_counts
 
     def execute(self):
         self.pre_requisite_complete_event.wait()
@@ -463,12 +525,10 @@ class VwapPiercingEngine(ILogic):
         # have fully closed by the simulated time (a candle starting at T closes at T + interval),
         # so the engine never sees prices from later in the day.
         if not self.__is_replay():
-            # Fyers ignores the time-of-day in the range and returns the whole day so far,
-            # INCLUDING the candle still forming -- drop it, or its cursor would move past that
-            # candle after seeing only its first few seconds and never check it once closed.
-            data = broker.fetchOHLC(self.future_symbol, str_from_date, now_str,
-                                    interval=f"{interval_minutes}minute",
-                                    all_data=True, market_type=self.FUTURE_MARKET_TYPE)
+            data = self.quotes_utility.fetchOHLC(
+                self.future_symbol, str_from_date, now_str,
+                interval=f"{interval_minutes}minute", all_data=True,
+                market_type=self.FUTURE_MARKET_TYPE)
             return self.__closed_by(data, interval_minutes, now_str)
         day = self.test_day_candles.get(interval_minutes)
         if day is None:
