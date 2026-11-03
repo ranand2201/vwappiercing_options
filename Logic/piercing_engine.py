@@ -38,6 +38,7 @@ Bollinger) are all parallel hypotheses tracked for comparison only; breaching
 one is logged but doesn't close the trade. Any trade still open at 14:50 is
 force-closed at the prevailing price regardless of SL/Exit-1..4 state.
 """
+import math
 import threading
 import time
 import traceback
@@ -864,9 +865,9 @@ class VwapPiercingEngine(ILogic):
     def __place_real_order(self, symbol, transaction_type, quantity, trade_type="", order_type="",
                             reason="", reference_price=0.0, place=True):
         """
-        Places a real MARKET order via the broker -- LIVE mode only, and only when
-        Config/strategy_config.json's live_trading_enabled is true (checked by callers before
-        this is ever reached). LIVE test mode places the same regular order (AMO isn't an option:
+        Places a configured real order via the broker -- LIVE mode only, and only when
+        the normalized live_trading_enabled setting is true (checked by callers before this is
+        ever reached). LIVE test mode places the same regular order (AMO isn't an option:
         Fyers' API rejects AMO orders). Returns (success, order_id); place_order itself already retries
         and returns "" on failure, so no exception handling is needed here beyond a defensive
         catch-all, since a bad symbol/permission error must never be allowed to crash the engine
@@ -881,6 +882,11 @@ class VwapPiercingEngine(ILogic):
         order_id) -- used for the exit of a trade whose entry BUY failed, so there's nothing to sell.
         """
         order_id = ""
+        execution_order_type = self.order_cfg[
+            "entry_order_type" if transaction_type.upper() == "BUY" else "exit_order_type"
+        ].upper()
+        price, trigger_price = self.__order_prices(
+            transaction_type, execution_order_type, reference_price)
         if place:
             broker = self.trade_utility.get_broker_utility()
             try:
@@ -889,7 +895,9 @@ class VwapPiercingEngine(ILogic):
                     transaction_type=transaction_type,
                     quantity=quantity,
                     product=self.order_cfg["product_type"],
-                    order_type=self.order_cfg["order_type"],
+                    order_type=execution_order_type,
+                    price=price,
+                    trigger_price=trigger_price,
                     market_type=self.__option_market_type(),
                 )
             except Exception:
@@ -916,6 +924,27 @@ class VwapPiercingEngine(ILogic):
             reference_price=reference_price,
         ))
         return success, order_id
+
+    def __order_prices(self, transaction_type, order_type, reference_price):
+        price = 0.0
+        trigger_price = 0.0
+        is_buy = transaction_type.upper() == "BUY"
+
+        if order_type in ("LIMIT", "SL"):
+            buffer_percent = float(self.order_cfg["limit_buffer_percent"])
+            direction = 1 if is_buy else -1
+            limit_price = reference_price * (1 + direction * buffer_percent / 100)
+            tick_size = float(self.order_cfg["tick_size"])
+            if tick_size <= 0:
+                raise ValueError("order_config.json tick_size must be greater than zero")
+            ticks = limit_price / tick_size
+            rounded_ticks = math.ceil(ticks - 1e-9) if is_buy else math.floor(ticks + 1e-9)
+            price = round(rounded_ticks * tick_size, 10)
+
+        if order_type in ("SL", "SL-M"):
+            trigger_price = reference_price
+
+        return price, trigger_price
 
     def __select_option_by_premium(self, broker, option_type):
         # Fyers' real getOptionChain() returns strike/type/live-premium for every contract around

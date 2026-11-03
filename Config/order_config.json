@@ -1,0 +1,21 @@
+{
+  "_comment_place_order": "Master safety switch. true: BUY the selected option on entry and SELL it when SL or target_exit hits (and at the 14:50 force exit / end of day). false: paper-trade only, no orders. Applies to LIVE and LIVE test mode, never BACKTEST.",
+  "place_order": true,
+
+  "_comment_target_exit": "Which of Exit1-1 also triggers the SELL, in addition to SL (SL always does). One of: null, \"exit1\", \"exit2\", \"exit3\", \"exit4\". null means only SL (or the 14:50 force exit) sells.",
+  "target_exit": "exit1",
+
+  "_comment_order_type": "Order type for the BUY (entry) and SELL (exit) orders. One of: \"MARKET\", \"LIMIT\", \"SL\" (stop-limit), \"SL-M\" (stop-market).",
+  "entry_order_type": "MARKET",
+  "exit_order_type": "MARKET",
+
+  "_comment_limit_buffer_percent": "LIMIT and SL orders only: how far the limit price sits from the option's reference price (its LTP at the signal). BUY: price = ref + buffer%; SELL: price = ref - buffer%. A larger buffer fills more reliably but at a worse price.",
+  "limit_buffer_percent": 1.05,
+
+  "_comment_trigger": "SL and SL-M orders only: the trigger price is the option's reference price itself.",
+
+  "tick_size": 0.05,
+  "product_type": "MIS",
+  "lot_size": 65,
+  "lot_count": 1
+}

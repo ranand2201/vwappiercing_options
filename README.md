@@ -126,13 +126,14 @@ the trade closed (e.g. `Exit1:+23.90, Exit3:+65.20 (Best: Exit3)`), or `SL` if n
 See `VWAPPiercingOptions.xlsx` for the original column layout reference (both sheets have since been
 extended beyond the simpler layout shown there).
 
-## Configuration (`Config/strategy_config.json`)
+## Configuration
 
-Every tunable trading parameter lives in one JSON file, loaded once at startup by `Config/config_loader.py`
-and applied identically to LIVE and BACKTEST (via `pattern_rules.configure()` for the pure predicates, and
-directly as instance attributes on `VwapPiercingEngine` for everything else) — a change here can never apply
-to only one of the two engines. A missing file, or a file missing individual keys, falls back to the same
-hardcoded defaults this strategy has always used, so it's always safe to delete or partially edit.
+Strategy parameters live in `Config/strategy_config.json`; real-order parameters live in
+`Config/order_config.json`. Both are loaded once at startup by `Config/config_loader.py`. Strategy settings
+apply identically to LIVE and BACKTEST (via `pattern_rules.configure()` for the pure predicates, and directly
+as instance attributes on `VwapPiercingEngine` for everything else). Missing files or individual keys fall
+back to defaults. The legacy `order` object in `strategy_config.json` is still supported, but values in
+`order_config.json` take precedence.
 
 | Key | What it controls |
 |---|---|
@@ -148,18 +149,30 @@ hardcoded defaults this strategy has always used, so it's always safe to delete 
 | `index_name` / `strike_step` | Which index, and its strike spacing |
 | `test_mode_start_time` / `test_mode_step_seconds` | LIVE test mode's simulated-clock start time and step size (see `--test_mode` below) |
 | `historical_option_lookup_delay_seconds` | Pacing between BACKTEST's per-strike historical option lookups, to stay under the broker's rate limit |
-| **`live_trading_enabled`** | **Master safety switch for real orders — see below** |
-| **`target_exit`** | **Which exit (if any) also closes the trade for real — see below** |
-| `order.order_type` / `order.product_type` / `order.lot_size` / `order.lot_count` | Real order details: e.g. `"MARKET"`, `"MIS"`, `75`, `1` |
+| **`live_trading_enabled`** | Legacy master safety switch for real orders; `order_config.json`'s `place_order` takes precedence |
+| **`target_exit`** | Which exit also closes the trade for real; `order_config.json` takes precedence |
+
+### Real-order configuration (`Config/order_config.json`)
+
+| Key | What it controls |
+|---|---|
+| `place_order` | Master safety switch for real orders; overrides legacy `live_trading_enabled` |
+| `target_exit` | Which exit (if any) also closes the trade for real: `"exit1"` through `"exit4"`, or `null` |
+| `entry_order_type` / `exit_order_type` | Order types for BUY entries and SELL exits: `"MARKET"`, `"LIMIT"`, `"SL"` or `"SL-M"` |
+| `limit_buffer_percent` | Offset from the option reference price for LIMIT and SL orders |
+| `tick_size` | Price increment used to round limit prices to a valid tick |
+| `product_type` / `lot_size` / `lot_count` | Broker product and order quantity settings |
 
 ### Real order placement
 
-By default, `live_trading_enabled` is `false` and this strategy behaves exactly as it always has: a signal +
-logging engine that places no real orders, in LIVE or BACKTEST/test mode alike. Setting it to `true` makes
-the **LIVE, non-test-mode** engine place a real MARKET order for the selected option at entry, and a real
-squaring-off order when the trade closes. `--test_mode` places the same **real** regular entry/exit orders
-(Fyers' API doesn't support AMO orders). It is never consulted in BACKTEST, which remains a pure preview regardless of
-this setting.
+`place_order` is the effective master switch for real orders (`live_trading_enabled` in
+`strategy_config.json` is its legacy fallback). The current `order_config.json` sets `place_order` to
+`true`, so LIVE mode is configured to place real orders; set it to `false` to disable them. BACKTEST
+never places orders regardless of this setting. When enabled, the **LIVE, non-test-mode** engine places
+the configured real entry/exit orders for the selected option.
+`--test_mode` places the same **real** regular entry/exit orders (Fyers' API doesn't support AMO orders).
+LIVE test mode also places configured orders; it is never consulted in BACKTEST, which remains a pure
+preview regardless of this setting.
 
 **SL is always a real exit** once `live_trading_enabled` is `true` — it's never optional. `target_exit` names
 one additional exit (`"exit1"`, `"exit2"`, `"exit3"`, `"exit4"`, or `null`) that also closes the trade for
@@ -180,9 +193,9 @@ order-placement gating, all of it) against a past date's candles on a simulated 
 `test_mode_start_time`, advancing `test_mode_step_seconds` per pass) instead of polling the broker in real
 time — so it produces the same trades a `run_backtest.py` run would for that date, but by exercising the
 exact live code path rather than a separate one. It's the fastest way to sanity-check a config change (or the
-live code itself) without waiting for market hours. **When `live_trading_enabled` is `true`, it places real
-MARKET entry/exit orders** for the historically-selected option, so during market hours a past date's replay
-trades for real (outside market hours the broker rejects them); otherwise it places no orders.
+live code itself) without waiting for market hours. **When `place_order` is `true`, it places real configured
+entry/exit orders** for the historically-selected option, so during market hours a past date's replay trades
+for real (outside market hours the broker rejects them); otherwise it places no orders.
 
 ## Running the strategy (via executor.py)
 
