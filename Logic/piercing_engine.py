@@ -1120,7 +1120,10 @@ class VwapPiercingEngine(ILogic):
         return True
 
     def __check_seek_piercing(self, ds: _DirectionState, row, ts):
-        window_open = pattern_rules.is_piercing_window_open(pattern_rules.time_of_day(ts), self.piercing_start_time)
+        # A candle is only knowable at its close. Use its close time for the window gate so a
+        # 09:30 5-min candle can qualify when the piercing window opens at 09:35.
+        close_time = (self.__session_time(ts) + timedelta(minutes=self.candle_interval_minutes)).strftime("%H:%M:%S")
+        window_open = pattern_rules.is_piercing_window_open(close_time, self.piercing_start_time)
         if not window_open:
             # LIVE polls every candle regardless of the window and always reports "seeking";
             # BACKTEST silently skips pre/post-window candles without a "seeking" line -- both
