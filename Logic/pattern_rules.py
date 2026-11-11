@@ -140,12 +140,15 @@ def is_vwap_reentry_triggered(check_price, vwap, direction):
 
 def candle_close_time(candle_ts, interval_minutes):
     """
-    A candle's close time, as a datetime, from its start timestamp ('YYYY-MM-DD HH:MM:SS') and its
-    interval. Broker candle timestamps label the candle's START (confirmed against Fyers' history
-    API, whose epoch stamps are the bar open), so a 5-min candle stamped 10:35 has not actually
-    closed -- and so isn't knowable -- until 10:40.
+    A candle's close time, as a naive local datetime, from its start timestamp and interval.
+    Broker timestamps may include the local timezone offset (e.g. '+05:30'); retain their wall
+    clock time because the strategy's session timestamps are local and naive. Broker candle
+    timestamps label the candle's START (confirmed against Fyers' history API, whose epoch stamps
+    are the bar open), so a 5-min candle stamped 10:35 has not actually closed -- and so isn't
+    knowable -- until 10:40.
     """
-    return datetime.strptime(candle_ts, "%Y-%m-%d %H:%M:%S") + timedelta(minutes=interval_minutes)
+    candle_start = datetime.fromisoformat(candle_ts).replace(tzinfo=None)
+    return candle_start + timedelta(minutes=interval_minutes)
 
 
 def has_closed_at_or_after(candle_ts, interval_minutes, reference_ts, reference_interval_minutes):
