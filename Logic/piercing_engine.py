@@ -234,8 +234,9 @@ class VwapPiercingEngine(ILogic):
         # but harmless (idempotent), and fixes the actual race here at the source.
         self.quotes_utility.set_trade_utility(self.trade_utility)
         self.config_data = self.obj_ui_adapter_config.get_data()
-        self.obj_paper_trade_writer = UserInterfacePaperTrade(args.key)
-        self.obj_order_log_writer = UserInterfaceOrderLog(args.key)
+        self.log_to_gsheet = getattr(args, "log_to_gsheet", True)
+        self.obj_paper_trade_writer = UserInterfacePaperTrade(args.key) if self.log_to_gsheet else None
+        self.obj_order_log_writer = UserInterfaceOrderLog(args.key) if self.log_to_gsheet else None
 
         # executor.py --test_mode true --date YYYY-MM-DD: run against that trading date's candles
         # instead of today's. The clock (start/stop/piercing window) still runs on real time; only
@@ -828,14 +829,20 @@ class VwapPiercingEngine(ILogic):
                 return
             ds.real_exit_order_complete = True
 
-        written = self.obj_paper_trade_writer.write_trade(
-            ds.current_trade, self.candle_interval_minutes, describe_exit_outcomes(ds.current_trade))
+        written = True
+        if self.obj_paper_trade_writer is not None:
+            written = self.obj_paper_trade_writer.write_trade(
+                ds.current_trade, self.candle_interval_minutes, describe_exit_outcomes(ds.current_trade))
         if not written:
             print(self.logic_name, f": ({ds.direction}) Trade close was not written to PaperTradeData; "
                   "keeping it pending for retry")
             return
-        print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
-             ds.current_trade.trade_type, ds.current_trade.option_name)
+        if self.log_to_gsheet:
+            print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ {self.__fmt_option_price(close_option_price)}, logged to PaperTradeData:",
+                  ds.current_trade.trade_type, ds.current_trade.option_name)
+        else:
+            print(self.logic_name, f": ({ds.direction}) Trade closed ({reason}) @ "
+                  f"{self.__fmt_option_price(close_option_price)}; Google Sheets logging disabled")
         ds.current_trade = None
         ds.option_symbol = ""
         ds.order_quantity = 0
@@ -909,20 +916,21 @@ class VwapPiercingEngine(ILogic):
         print(self.logic_name, f": REAL ORDER {status} -- "
              f"{transaction_type} {quantity} x {symbol}", f"order_id={order_id!r}" if success else "")
         now = datetime.now(IST)
-        self.obj_order_log_writer.write_order(order_log_row(
-            timestamp=now.strftime("%H:%M:%S"),
-            date=now.strftime("%Y-%m-%d"),
-            future=self.future_symbol,
-            option_name=symbol,
-            trade_type=trade_type,
-            order_type=order_type,
-            transaction_type=transaction_type,
-            quantity=quantity,
-            order_id=order_id,
-            status=status,
-            reason=f"{reason} (test mode)".strip() if self.test_mode else reason,
-            reference_price=reference_price,
-        ))
+        if getattr(self, "log_to_gsheet", True):
+            self.obj_order_log_writer.write_order(order_log_row(
+                timestamp=now.strftime("%H:%M:%S"),
+                date=now.strftime("%Y-%m-%d"),
+                future=self.future_symbol,
+                option_name=symbol,
+                trade_type=trade_type,
+                order_type=order_type,
+                transaction_type=transaction_type,
+                quantity=quantity,
+                order_id=order_id,
+                status=status,
+                reason=f"{reason} (test mode)".strip() if self.test_mode else reason,
+                reference_price=reference_price,
+            ))
         return success, order_id
 
     def __order_prices(self, transaction_type, order_type, reference_price):
