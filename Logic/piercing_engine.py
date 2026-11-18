@@ -448,8 +448,6 @@ class VwapPiercingEngine(ILogic):
     def exit_execution_thread(self):
         print(self.logic_name, ": Start of Exiting Thread")
         self.execute_thread.join()
-        self.quotes_utility.stop()
-        self.quotes_utility.get_thread_info().join()
         print(self.logic_name, ": End of Exiting Thread")
 
     # ------------------------------------------------------------------
