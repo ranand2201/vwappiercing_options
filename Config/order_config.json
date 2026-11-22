@@ -2,6 +2,9 @@
   "_comment_place_order": "Master safety switch. true: BUY the selected option on entry and SELL it when SL or target_exit hits (and at the 14:50 force exit / end of day). false: paper-trade only, no orders. Applies to LIVE and LIVE test mode, never BACKTEST.",
   "place_order": true,
 
+  "_comment_order_days": "Days on which real broker orders may be placed. The strategy and paper-trade logging continue on all days. Use [\"All\"] for every day or a list such as [\"Monday\", \"Tuesday\"].",
+  "order_days": ["All"],
+
   "_comment_target_exit": "Which of Exit1-1 also triggers the SELL, in addition to SL (SL always does). One of: null, \"exit1\", \"exit2\", \"exit3\", \"exit4\". null means only SL (or the 14:50 force exit) sells.",
   "target_exit": "exit1",
 

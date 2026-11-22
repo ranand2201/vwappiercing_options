@@ -60,7 +60,7 @@ from ..UserInterface.adapter.login.login import *
 from ..UserInterface.adapter.config.config import *
 from ..UserInterface.gsheet.paper_trade.paper_trade import *
 from ..UserInterface.gsheet.order_log.order_log import *
-from ..Config.config_loader import load_config
+from ..Config.config_loader import is_order_day, load_config, should_place_orders
 from . import pattern_rules
 from .option_selection import select_by_premium, select_cheapest_in_band
 
@@ -195,6 +195,7 @@ class VwapPiercingEngine(ILogic):
         # live trading is enabled; target_exit additionally makes ONE of Exit1-4 real too, so the
         # position closes on whichever of the two actually hits first.
         self.live_trading_enabled = bool(self.cfg.get("live_trading_enabled", False))
+        self.real_orders_enabled = False
         self.target_exit_field, self.target_exit_label = TARGET_EXIT_FIELD_MAP.get(
             (self.cfg.get("target_exit") or "").lower(), (None, None))
         self.exit_labels = {
@@ -243,13 +244,21 @@ class VwapPiercingEngine(ILogic):
         # the date part changes.
         self.test_mode = bool(getattr(args, "test_mode", False))
         self.session_date_str = args.date if self.test_mode else datetime.now(IST).date().strftime("%Y-%m-%d")
+        order_day_allowed = is_order_day(
+            self.session_date_str, self.order_cfg.get("order_days", ["All"]))
+        self.real_orders_enabled = should_place_orders(
+            self.live_trading_enabled, self.session_date_str,
+            self.order_cfg.get("order_days", ["All"]))
+        if self.live_trading_enabled and not order_day_allowed:
+            print(self.logic_name, ": Real order placement disabled for",
+                  self.session_date_str, "-- not included in order_days; strategy will run paper-only")
         # simulated test-mode clock (see __now / __advance_or_sleep)
         self.test_clock = datetime.strptime(f"{self.session_date_str} {self.test_mode_start_time}",
                                             "%Y-%m-%d %H:%M:%S")
         if self.test_mode:
             print(self.logic_name, ": TEST MODE -- using candles for", self.session_date_str,
                   "with the clock starting at", self.test_mode_start_time)
-            if self.live_trading_enabled:
+            if self.real_orders_enabled:
                 print(self.logic_name, ": WARNING -- live_trading_enabled is true: TEST MODE WILL PLACE "
                       "REAL MARKET ORDERS for the replayed trades' entries and exits")
             # test mode prices everything from the test date's history, reusing the BACKTEST
@@ -674,9 +683,8 @@ class VwapPiercingEngine(ILogic):
 
     def __close_trade(self, ds: _DirectionState, outcome):
         # a replayed trade closed on a 1-min candle ("SL", "FORCE", or the configured target
-        # exit's label): LIVE test mode writes it to PaperTradeData like any live trade (but never
-        # places a real order, regardless of live_trading_enabled -- test mode is a preview only),
-        # BACKTEST collects it for the caller.
+        # exit's label): LIVE test mode writes it to PaperTradeData like any live trade, and only
+        # places real orders when enabled for the replay date; BACKTEST collects it for the caller.
         self.__stamp_mae_mfe(ds)
         if self.mode == Mode.LIVE:
             reason = "Force Exit 14:50" if outcome == "FORCE" else outcome
@@ -815,7 +823,7 @@ class VwapPiercingEngine(ILogic):
         # the one failure mode that must NOT reset the state machine: if we think we're flat but
         # the real SELL never went through, we'd stop tracking a position we still hold. Keep the
         # trade open and let the next tick's exit check retry this same close.
-        if self.live_trading_enabled and ds.option_symbol and ds.order_quantity \
+        if self.real_orders_enabled and ds.option_symbol and ds.order_quantity \
             and not ds.real_exit_order_complete:
             order_placed, _ = self.__place_real_order(ds.option_symbol, "SELL", ds.order_quantity,
                                                        trade_type=ds.direction, order_type="Exit",
@@ -1293,7 +1301,7 @@ class VwapPiercingEngine(ILogic):
                 return
 
             order_quantity = self.__order_quantity()
-            if self.live_trading_enabled:
+            if self.real_orders_enabled:
                 order_placed, _ = self.__place_real_order(option_symbol, "BUY", order_quantity,
                                                            trade_type=ds.direction, order_type="Entry",
                                                            reference_price=option_price)
@@ -1315,8 +1323,8 @@ class VwapPiercingEngine(ILogic):
                           f"option price data unavailable for this trade")
 
             # LIVE test mode: place a real entry order (see __place_real_order) for the
-            # historically-selected option, gated on the same live_trading_enabled switch.
-            if self.mode == Mode.LIVE and self.test_mode and self.live_trading_enabled and option_symbol:
+            # historically-selected option, gated on the same weekday-aware real-order switch.
+            if self.mode == Mode.LIVE and self.test_mode and self.real_orders_enabled and option_symbol:
                 order_quantity = self.__order_quantity()
                 order_placed, _ = self.__place_real_order(option_symbol, "BUY", order_quantity,
                                                            trade_type=ds.direction, order_type="Entry",

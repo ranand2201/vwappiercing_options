@@ -15,10 +15,12 @@ constants and are NOT in here.
 """
 import json
 import os
+from datetime import datetime
 
 _CONFIG_DIR = os.path.dirname(os.path.abspath(__file__))
 _DEFAULT_CONFIG_PATH = os.path.join(_CONFIG_DIR, "strategy_config.json")
 _DEFAULT_ORDER_CONFIG_PATH = os.path.join(_CONFIG_DIR, "order_config.json")
+WEEKDAYS = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
 
 DEFAULTS = {
     "day_start_time": "09:15:00",
@@ -55,8 +57,49 @@ DEFAULTS = {
         "product_type": "MIS",
         "lot_size": 65,  # NSE-fixed NIFTY lot size
         "lot_count": 1,
+        "order_days": ["All"],
     },
 }
+
+
+def normalize_order_days(value):
+    if isinstance(value, str):
+        days = value.split(",")
+    elif isinstance(value, list):
+        days = value
+    else:
+        raise ValueError("order_days must be 'All', a weekday, or a list of weekdays")
+
+    normalized_days = []
+    for day in days:
+        if not isinstance(day, str):
+            raise ValueError("order_days entries must be weekday names or 'All'")
+        normalized = day.strip().title()
+        if normalized.lower() == "all":
+            normalized = "All"
+        elif normalized not in WEEKDAYS:
+            raise ValueError("order_days entries must be Monday through Sunday or 'All'")
+        if normalized not in normalized_days:
+            normalized_days.append(normalized)
+
+    if not normalized_days:
+        raise ValueError("order_days must contain at least one weekday or 'All'")
+    if "All" in normalized_days and len(normalized_days) > 1:
+        raise ValueError("'All' cannot be combined with individual order_days")
+    return normalized_days
+
+
+def is_order_day(trade_date, order_days):
+    normalized_days = normalize_order_days(order_days)
+    if normalized_days == ["All"]:
+        return True
+    if isinstance(trade_date, str):
+        trade_date = datetime.strptime(trade_date, "%Y-%m-%d").date()
+    return trade_date.strftime("%A") in normalized_days
+
+
+def should_place_orders(live_trading_enabled, trade_date, order_days):
+    return bool(live_trading_enabled) and is_order_day(trade_date, order_days)
 
 
 def _merge_order_config(order_cfg, loaded_order_cfg):
@@ -114,4 +157,5 @@ def load_config(path=None, order_path=None):
             cfg["target_exit"] = loaded_order_cfg["target_exit"]
         _merge_order_config(cfg["order"], loaded_order_cfg)
 
+    cfg["order"]["order_days"] = normalize_order_days(cfg["order"]["order_days"])
     return cfg
